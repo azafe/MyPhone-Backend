@@ -41,7 +41,8 @@ router.get('/summary', requireRole('admin', 'seller'), async (req, res) => {
   const total_sales_ars = (sales ?? []).reduce((sum, sale) => sum + Number(sale.total_ars ?? 0), 0);
   const total_items_sold = (saleItems ?? []).length;
   const estimated_margin_ars = (saleItems ?? []).reduce((sum, item) => {
-    const purchase = Number(item.stock_items?.purchase_ars ?? 0);
+    const stockItem = Array.isArray(item.stock_items) ? item.stock_items[0] : item.stock_items;
+    const purchase = Number(stockItem?.purchase_ars ?? 0);
     return sum + (Number(item.sale_price_ars ?? 0) - purchase);
   }, 0);
 

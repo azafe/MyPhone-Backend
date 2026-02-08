@@ -6,6 +6,7 @@ import { tradeInsRouter } from './modules/tradeins/index.js';
 import { installmentRulesRouter } from './modules/rules/index.js';
 import { financeRouter } from './modules/finance/index.js';
 import { adminUsersRouter } from './modules/adminUsers/index.js';
+import { stockItemsRouter } from './modules/stockItems/index.js';
 
 export const app = express();
 
@@ -21,6 +22,7 @@ app.use('/api/trade-ins', tradeInsRouter);
 app.use('/api/installment-rules', installmentRulesRouter);
 app.use('/api/finance', financeRouter);
 app.use('/api/admin/users', adminUsersRouter);
+app.use('/api/stock-items', stockItemsRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: { code: 'not_found', message: `Route not found: ${req.method} ${req.path}` } });

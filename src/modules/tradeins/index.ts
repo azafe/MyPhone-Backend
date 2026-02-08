@@ -30,15 +30,15 @@ const tradeInPatchSchema = z.object({
 const convertSchema = z.object({
   category: z.enum(['used_premium', 'outlet']),
   sale_price_ars: z.number().min(0),
-  sale_price_usd: z.number().min(0).optional(),
-  warranty_days: z.number().int().positive().optional(),
-  warranty_days_default: z.number().int().positive().optional(),
-  battery_pct: z.number().int().min(0).max(100).optional(),
-  storage_gb: z.number().int().positive().optional(),
-  color: z.string().optional(),
-  color_other: z.string().optional(),
-  imei: z.string().optional(),
-  notes: z.string().optional()
+  sale_price_usd: z.number().min(0).nullable().optional(),
+  warranty_days: z.number().int().positive().nullable().optional(),
+  warranty_days_default: z.number().int().positive().nullable().optional(),
+  battery_pct: z.number().int().min(0).max(100).nullable().optional(),
+  storage_gb: z.number().int().positive().nullable().optional(),
+  color: z.string().nullable().optional(),
+  color_other: z.string().nullable().optional(),
+  imei: z.string().nullable().optional(),
+  notes: z.string().nullable().optional()
 });
 
 router.post('/', requireRole('admin', 'seller'), async (req, res) => {
@@ -103,16 +103,36 @@ router.post('/:id/convert-to-stock', requireRole('admin', 'seller'), async (req,
   }
 
   const purchase_ars = Number(tradeIn.trade_value_usd) * Number(tradeIn.fx_rate_used);
+  const storage_gb =
+    parsed.data.storage_gb !== undefined
+      ? parsed.data.storage_gb
+      : tradeIn.device?.storage_gb ?? null;
+  const color =
+    parsed.data.color !== undefined
+      ? parsed.data.color
+      : tradeIn.device?.color ?? null;
+  const imei =
+    parsed.data.imei !== undefined
+      ? parsed.data.imei
+      : tradeIn.device?.imei ?? null;
+
+  const allowedConditions = new Set(['new', 'like_new', 'used', 'outlet']);
+  const conditionRaw = tradeIn.device?.condition ?? null;
+  const condition = conditionRaw && allowedConditions.has(conditionRaw) ? conditionRaw : 'used';
+
   const stockItemPayload = {
+    brand: tradeIn.device?.brand ?? null,
+    model: tradeIn.device?.model ?? null,
+    condition,
     category: parsed.data.category,
     sale_price_ars: parsed.data.sale_price_ars,
     sale_price_usd: parsed.data.sale_price_usd ?? null,
     warranty_days: parsed.data.warranty_days ?? parsed.data.warranty_days_default ?? 90,
     battery_pct: parsed.data.battery_pct ?? null,
-    storage_gb: parsed.data.storage_gb ?? tradeIn.device?.storage_gb ?? null,
-    color: parsed.data.color ?? tradeIn.device?.color ?? null,
+    storage_gb,
+    color,
     color_other: parsed.data.color_other ?? null,
-    imei: parsed.data.imei ?? tradeIn.device?.imei ?? null,
+    imei,
     notes: parsed.data.notes ?? null,
     purchase_usd: tradeIn.trade_value_usd,
     fx_rate_used: tradeIn.fx_rate_used,
