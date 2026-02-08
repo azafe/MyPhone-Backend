@@ -30,7 +30,13 @@ const tradeInPatchSchema = z.object({
 const convertSchema = z.object({
   category: z.enum(['used_premium', 'outlet']),
   sale_price_ars: z.number().min(0),
+  sale_price_usd: z.number().min(0).optional(),
+  warranty_days: z.number().int().positive().optional(),
   warranty_days_default: z.number().int().positive().optional(),
+  battery_pct: z.number().int().min(0).max(100).optional(),
+  storage_gb: z.number().int().positive().optional(),
+  color: z.string().optional(),
+  color_other: z.string().optional(),
   imei: z.string().optional(),
   notes: z.string().optional()
 });
@@ -100,7 +106,12 @@ router.post('/:id/convert-to-stock', requireRole('admin', 'seller'), async (req,
   const stockItemPayload = {
     category: parsed.data.category,
     sale_price_ars: parsed.data.sale_price_ars,
-    warranty_days_default: parsed.data.warranty_days_default ?? 90,
+    sale_price_usd: parsed.data.sale_price_usd ?? null,
+    warranty_days: parsed.data.warranty_days ?? parsed.data.warranty_days_default ?? 90,
+    battery_pct: parsed.data.battery_pct ?? null,
+    storage_gb: parsed.data.storage_gb ?? tradeIn.device?.storage_gb ?? null,
+    color: parsed.data.color ?? tradeIn.device?.color ?? null,
+    color_other: parsed.data.color_other ?? null,
     imei: parsed.data.imei ?? tradeIn.device?.imei ?? null,
     notes: parsed.data.notes ?? null,
     purchase_usd: tradeIn.trade_value_usd,
