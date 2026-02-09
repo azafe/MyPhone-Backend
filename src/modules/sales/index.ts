@@ -50,16 +50,170 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
 
   const payload = parsed.data;
 
-  const { data, error } = await supabaseAdmin.rpc('rpc_create_sale', { payload });
+  // 1) Upsert customer by phone
+  const { data: existingCustomer, error: existingCustomerError } = await supabaseAdmin
+    .from('customers')
+    .select('id')
+    .eq('phone', payload.customer.phone)
+    .maybeSingle();
 
-  if (error) {
-    return res.status(400).json({ error: { code: 'sale_create_failed', message: 'RPC failed', details: error.message } });
+  if (existingCustomerError) {
+    return res.status(400).json({
+      error: { code: 'customer_lookup_failed', message: 'Customer lookup failed', details: existingCustomerError.message }
+    });
+  }
+
+  let customerId = existingCustomer?.id;
+  if (!customerId) {
+    const { data: newCustomer, error: newCustomerError } = await supabaseAdmin
+      .from('customers')
+      .insert({ name: payload.customer.name, phone: payload.customer.phone })
+      .select('id')
+      .single();
+
+    if (newCustomerError || !newCustomer) {
+      return res.status(400).json({
+        error: { code: 'customer_create_failed', message: 'Customer create failed', details: newCustomerError?.message }
+      });
+    }
+    customerId = newCustomer.id;
+  } else {
+    // Keep name fresh
+    await supabaseAdmin.from('customers').update({ name: payload.customer.name }).eq('id', customerId);
+  }
+
+  // 2) Validate stock items
+  const stockIds = payload.items.map((item) => item.stock_item_id);
+  const { data: stockItems, error: stockError } = await supabaseAdmin
+    .from('stock_items')
+    .select('id, status, warranty_days, warranty_days_default')
+    .in('id', stockIds);
+
+  if (stockError) {
+    return res.status(400).json({
+      error: { code: 'stock_lookup_failed', message: 'Stock lookup failed', details: stockError.message }
+    });
+  }
+
+  const stockById = new Map((stockItems ?? []).map((item) => [item.id, item]));
+  const missing = stockIds.filter((id) => !stockById.has(id));
+  if (missing.length > 0) {
+    return res.status(400).json({
+      error: { code: 'stock_missing', message: 'Some stock items do not exist', details: missing }
+    });
+  }
+
+  const unavailable = (stockItems ?? []).filter((item) => item.status !== 'available');
+  if (unavailable.length > 0) {
+    return res.status(400).json({
+      error: {
+        code: 'stock_unavailable',
+        message: 'Some stock items are not available',
+        details: unavailable.map((item) => ({ id: item.id, status: item.status }))
+      }
+    });
+  }
+
+  // 3) Create sale
+  const { data: sale, error: saleError } = await supabaseAdmin
+    .from('sales')
+    .insert({
+      sale_date: payload.sale_date,
+      customer_id: customerId,
+      payment_method: payload.payment.method,
+      card_brand: payload.payment.card_brand ?? null,
+      installments: payload.payment.installments ?? null,
+      surcharge_pct: payload.payment.surcharge_pct ?? null,
+      deposit_ars: payload.payment.deposit_ars ?? null,
+      total_ars: payload.payment.total_ars
+    })
+    .select('id')
+    .single();
+
+  if (saleError || !sale) {
+    return res.status(400).json({
+      error: { code: 'sale_create_failed', message: 'Sale create failed', details: saleError?.message }
+    });
+  }
+
+  const saleId = sale.id;
+
+  // 4) Create sale items
+  const saleItemsPayload = payload.items.map((item) => ({
+    sale_id: saleId,
+    stock_item_id: item.stock_item_id,
+    sale_price_ars: item.sale_price_ars
+  }));
+
+  const { error: saleItemsError } = await supabaseAdmin.from('sale_items').insert(saleItemsPayload);
+  if (saleItemsError) {
+    return res.status(400).json({
+      error: { code: 'sale_items_create_failed', message: 'Sale items create failed', details: saleItemsError.message }
+    });
+  }
+
+  // 5) Mark stock as sold
+  const { error: stockUpdateError } = await supabaseAdmin
+    .from('stock_items')
+    .update({ status: 'sold' })
+    .in('id', stockIds);
+
+  if (stockUpdateError) {
+    return res.status(400).json({
+      error: { code: 'stock_update_failed', message: 'Stock status update failed', details: stockUpdateError.message }
+    });
+  }
+
+  // 6) Create warranties (best effort if table exists)
+  const warrantyRows = (stockItems ?? []).map((item) => {
+    const warrantyDays = Number(item.warranty_days ?? item.warranty_days_default ?? 90);
+    const start = new Date(payload.sale_date);
+    const end = new Date(start);
+    end.setDate(end.getDate() + warrantyDays);
+    return {
+      sale_id: saleId,
+      stock_item_id: item.id,
+      customer_id: customerId,
+      warranty_days: warrantyDays,
+      warranty_start: start.toISOString(),
+      warranty_end: end.toISOString()
+    };
+  });
+
+  const { error: warrantyError } = await supabaseAdmin.from('warranties').insert(warrantyRows);
+  if (warrantyError) {
+    return res.status(400).json({
+      error: { code: 'warranty_create_failed', message: 'Warranty create failed', details: warrantyError.message }
+    });
+  }
+
+  // 7) Trade-in (optional)
+  let tradeInId: string | null = null;
+  if (payload.trade_in?.enabled) {
+    const { data: tradeIn, error: tradeInError } = await supabaseAdmin
+      .from('trade_ins')
+      .insert({
+        sale_id: saleId,
+        device: payload.trade_in.device,
+        trade_value_usd: payload.trade_in.trade_value_usd,
+        fx_rate_used: payload.trade_in.fx_rate_used,
+        status: 'valued'
+      })
+      .select('id')
+      .single();
+
+    if (tradeInError || !tradeIn) {
+      return res.status(400).json({
+        error: { code: 'trade_in_create_failed', message: 'Trade-in create failed', details: tradeInError?.message }
+      });
+    }
+    tradeInId = tradeIn.id;
   }
 
   return res.status(201).json({
-    sale_id: data?.sale_id ?? data?.id ?? null,
-    trade_in_id: data?.trade_in_id ?? null,
-    customer_id: data?.customer_id ?? null
+    sale_id: saleId,
+    trade_in_id: tradeInId,
+    customer_id: customerId
   });
 });
 
