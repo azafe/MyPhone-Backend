@@ -170,13 +170,17 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     const start = new Date(payload.sale_date);
     const end = new Date(start);
     end.setDate(end.getDate() + warrantyDays);
+    const startIso = start.toISOString();
+    const endIso = end.toISOString();
     return {
       sale_id: saleId,
       stock_item_id: item.id,
       customer_id: customerId,
+      start_date: startIso,
+      end_date: endIso,
       warranty_days: warrantyDays,
-      warranty_start: start.toISOString(),
-      warranty_end: end.toISOString()
+      warranty_start: startIso,
+      warranty_end: endIso
     };
   });
 
