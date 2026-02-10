@@ -40,6 +40,42 @@ const saleSchema = z.object({
   }).optional()
 });
 
+router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('sales')
+    .select('*, sale_items(stock_item_id, stock_items(model, imei))')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    return res.status(400).json({
+      error: { code: 'sales_fetch_failed', message: 'Sales fetch failed', details: error.message }
+    });
+  }
+
+  const rows = (data ?? []).flatMap((sale) => {
+    const items = sale.sale_items ?? [];
+    if (items.length === 0) {
+      return [
+        {
+          ...sale,
+          stock_item_id: null,
+          stock_model: null,
+          stock_imei: null
+        }
+      ];
+    }
+
+    return items.map((item: { stock_item_id: string; stock_items?: { model: string | null; imei: string | null } }) => ({
+      ...sale,
+      stock_item_id: item.stock_item_id,
+      stock_model: item.stock_items?.model ?? null,
+      stock_imei: item.stock_items?.imei ?? null
+    }));
+  });
+
+  return res.json({ sales: rows });
+});
+
 router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   const parsed = saleSchema.safeParse(req.body);
   if (!parsed.success) {
