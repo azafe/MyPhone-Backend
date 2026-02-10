@@ -43,7 +43,7 @@ const saleSchema = z.object({
 router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('sales')
-    .select('*, sale_items(stock_item_id, stock_items(model, imei))')
+    .select('*, customers(name, phone), sale_items(stock_item_id, stock_items(model, imei))')
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -54,13 +54,17 @@ router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
 
   const rows = (data ?? []).flatMap((sale) => {
     const items = sale.sale_items ?? [];
+    const customerName = sale.customers?.name ?? null;
+    const customerPhone = sale.customers?.phone ?? null;
     if (items.length === 0) {
       return [
         {
           ...sale,
           stock_item_id: null,
           stock_model: null,
-          stock_imei: null
+          stock_imei: null,
+          customer_name: customerName,
+          customer_phone: customerPhone
         }
       ];
     }
@@ -69,7 +73,9 @@ router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
       ...sale,
       stock_item_id: item.stock_item_id,
       stock_model: item.stock_items?.model ?? null,
-      stock_imei: item.stock_items?.imei ?? null
+      stock_imei: item.stock_items?.imei ?? null,
+      customer_name: customerName,
+      customer_phone: customerPhone
     }));
   });
 
