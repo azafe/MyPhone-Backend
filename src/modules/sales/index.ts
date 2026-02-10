@@ -221,4 +221,73 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   });
 });
 
+router.delete('/:id', requireRole('admin'), async (req, res) => {
+  const saleId = req.params.id;
+
+  // Load related sale items to restore stock
+  const { data: saleItems, error: saleItemsError } = await supabaseAdmin
+    .from('sale_items')
+    .select('stock_item_id')
+    .eq('sale_id', saleId);
+
+  if (saleItemsError) {
+    return res.status(400).json({
+      error: { code: 'sale_items_fetch_failed', message: 'Sale items fetch failed', details: saleItemsError.message }
+    });
+  }
+
+  const stockIds = (saleItems ?? []).map((item) => item.stock_item_id).filter(Boolean);
+
+  const { error: warrantiesError } = await supabaseAdmin.from('warranties').delete().eq('sale_id', saleId);
+  if (warrantiesError) {
+    return res.status(400).json({
+      error: { code: 'warranties_delete_failed', message: 'Warranties delete failed', details: warrantiesError.message }
+    });
+  }
+
+  const { error: tradeInsError } = await supabaseAdmin.from('trade_ins').delete().eq('sale_id', saleId);
+  if (tradeInsError) {
+    return res.status(400).json({
+      error: { code: 'trade_ins_delete_failed', message: 'Trade-ins delete failed', details: tradeInsError.message }
+    });
+  }
+
+  const { error: saleItemsDeleteError } = await supabaseAdmin.from('sale_items').delete().eq('sale_id', saleId);
+  if (saleItemsDeleteError) {
+    return res.status(400).json({
+      error: { code: 'sale_items_delete_failed', message: 'Sale items delete failed', details: saleItemsDeleteError.message }
+    });
+  }
+
+  const { error: saleDeleteError, count } = await supabaseAdmin
+    .from('sales')
+    .delete({ count: 'exact' })
+    .eq('id', saleId);
+
+  if (saleDeleteError) {
+    return res.status(400).json({
+      error: { code: 'sale_delete_failed', message: 'Sale delete failed', details: saleDeleteError.message }
+    });
+  }
+
+  if (!count) {
+    return res.status(404).json({ error: { code: 'not_found', message: 'Sale not found' } });
+  }
+
+  if (stockIds.length > 0) {
+    const { error: stockRestoreError } = await supabaseAdmin
+      .from('stock_items')
+      .update({ status: 'available' })
+      .in('id', stockIds);
+
+    if (stockRestoreError) {
+      return res.status(400).json({
+        error: { code: 'stock_restore_failed', message: 'Stock restore failed', details: stockRestoreError.message }
+      });
+    }
+  }
+
+  return res.status(204).send();
+});
+
 export const salesRouter = router;
