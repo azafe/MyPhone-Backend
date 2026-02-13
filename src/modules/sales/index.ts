@@ -1,79 +1,332 @@
+import { createHash } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../../lib/supabaseAdmin.js';
 import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
+const IDEMPOTENCY_ROUTE = 'POST /api/sales';
 
-const saleSchema = z.object({
-  sale_date: z.string().datetime(),
-  customer: z.object({
-    name: z.string().min(1),
-    phone: z.string().min(6)
-  }),
-  payment: z.object({
-    method: z.string().min(1),
-    card_brand: z.string().optional(),
-    installments: z.number().int().positive().optional(),
-    surcharge_pct: z.number().min(0).optional(),
-    deposit_ars: z.number().min(0).optional(),
-    total_ars: z.number().min(0)
-  }),
-  items: z.array(
-    z.object({
-      stock_item_id: z.string().min(1),
-      sale_price_ars: z.number().min(0)
-    })
-  ).min(1),
-  trade_in: z.object({
-    enabled: z.boolean(),
-    device: z.object({
-      brand: z.string().min(1),
-      model: z.string().min(1),
-      storage_gb: z.number().int().positive().optional(),
-      color: z.string().optional(),
-      condition: z.string().optional(),
-      imei: z.string().optional()
-    }),
-    trade_value_usd: z.number().min(0),
-    fx_rate_used: z.number().min(0)
-  }).optional()
+const paymentMethodSchema = z.enum(['cash', 'transfer', 'card', 'mixed', 'trade_in']);
+
+const customerSchema = z.object({
+  name: z.string().min(1),
+  phone: z.string().min(6)
 });
+
+const paymentLegacySchema = z.object({
+  method: paymentMethodSchema.optional(),
+  card_brand: z.string().nullable().optional(),
+  installments: z.coerce.number().int().positive().nullable().optional(),
+  surcharge_pct: z.coerce.number().min(0).nullable().optional(),
+  deposit_ars: z.coerce.number().min(0).nullable().optional(),
+  total_ars: z.coerce.number().positive().optional()
+});
+
+const saleItemSchema = z.object({
+  stock_item_id: z.string().uuid(),
+  qty: z.coerce.number().int().min(1).default(1),
+  sale_price_ars: z.coerce.number().positive()
+});
+
+const tradeInSchema = z.object({
+  enabled: z.boolean(),
+  device: z.object({
+    brand: z.string().min(1),
+    model: z.string().min(1),
+    storage_gb: z.coerce.number().int().positive().optional(),
+    color: z.string().optional(),
+    condition: z.string().optional(),
+    imei: z.string().optional()
+  }),
+  trade_value_usd: z.coerce.number().min(0),
+  fx_rate_used: z.coerce.number().min(0)
+});
+
+const saleCreateSchema = z.object({
+  sale_date: z.string().datetime(),
+  customer: customerSchema.optional(),
+  customer_id: z.string().uuid().optional(),
+  payment_method: paymentMethodSchema.optional(),
+  card_brand: z.string().nullable().optional(),
+  installments: z.coerce.number().int().positive().nullable().optional(),
+  surcharge_pct: z.coerce.number().min(0).nullable().optional(),
+  deposit_ars: z.coerce.number().min(0).nullable().optional(),
+  total_ars: z.coerce.number().positive().optional(),
+  items: z.array(saleItemSchema).min(1),
+  payment: paymentLegacySchema.optional(),
+  trade_in: tradeInSchema.optional()
+}).superRefine((value, ctx) => {
+  if (!value.customer_id && !value.customer) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'customer_or_customer_id_required',
+      path: ['customer']
+    });
+  }
+
+  const seen = new Set<string>();
+  for (const item of value.items) {
+    if (seen.has(item.stock_item_id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'duplicate_stock_item_id',
+        path: ['items']
+      });
+      break;
+    }
+    seen.add(item.stock_item_id);
+  }
+});
+
+const salePatchSchema = z.object({
+  sale_date: z.string().datetime().optional(),
+  customer: customerSchema.optional(),
+  customer_id: z.string().uuid().optional(),
+  payment_method: paymentMethodSchema.optional(),
+  card_brand: z.string().nullable().optional(),
+  installments: z.coerce.number().int().positive().nullable().optional(),
+  surcharge_pct: z.coerce.number().min(0).nullable().optional(),
+  deposit_ars: z.coerce.number().min(0).nullable().optional(),
+  total_ars: z.coerce.number().positive().optional(),
+  items: z.array(saleItemSchema).min(1).optional(),
+  payment: paymentLegacySchema.partial().optional()
+}).superRefine((value, ctx) => {
+  if (Object.keys(value).length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'empty_patch_payload',
+      path: []
+    });
+  }
+
+  if (value.items) {
+    const seen = new Set<string>();
+    for (const item of value.items) {
+      if (seen.has(item.stock_item_id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'duplicate_stock_item_id',
+          path: ['items']
+        });
+        break;
+      }
+      seen.add(item.stock_item_id);
+    }
+  }
+});
+
+const cancelSchema = z.object({
+  reason: z.string().trim().min(3).max(500)
+});
+
+type SaleItemInput = {
+  stock_item_id: string;
+  qty: number;
+  sale_price_ars: number;
+};
+
+type NormalizedCreatePayload = {
+  sale_date: string;
+  customer?: { name: string; phone: string };
+  customer_id?: string;
+  payment_method: z.infer<typeof paymentMethodSchema>;
+  card_brand: string | null;
+  installments: number | null;
+  surcharge_pct: number | null;
+  deposit_ars: number | null;
+  total_ars: number;
+  input_total_ars: number | null;
+  items: SaleItemInput[];
+  payment?: z.infer<typeof paymentLegacySchema>;
+  trade_in?: z.infer<typeof tradeInSchema>;
+};
+
+type NormalizedPatchPayload = {
+  sale_date?: string;
+  customer?: { name: string; phone: string };
+  customer_id?: string;
+  payment_method?: z.infer<typeof paymentMethodSchema>;
+  card_brand?: string | null;
+  installments?: number | null;
+  surcharge_pct?: number | null;
+  deposit_ars?: number | null;
+  total_ars?: number;
+  input_total_ars?: number | null;
+  items?: SaleItemInput[];
+};
+
+type RpcLikeError = {
+  message?: string;
+  details?: string;
+  code?: string;
+};
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`).join(',')}}`;
+}
+
+function hashPayload(value: unknown): string {
+  return createHash('sha256').update(stableStringify(value)).digest('hex');
+}
+
+function buildItems(items: z.infer<typeof saleItemSchema>[]): SaleItemInput[] {
+  return items.map((item) => ({
+    stock_item_id: item.stock_item_id,
+    qty: item.qty,
+    sale_price_ars: item.sale_price_ars
+  }));
+}
+
+function computeServerTotal(items: SaleItemInput[]): number {
+  return items.reduce((sum, item) => sum + (item.qty * item.sale_price_ars), 0);
+}
+
+function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): NormalizedCreatePayload {
+  const paymentMethod = input.payment_method ?? input.payment?.method ?? 'cash';
+  const cardBrand = input.card_brand ?? input.payment?.card_brand ?? null;
+  const installments = input.installments ?? input.payment?.installments ?? null;
+  const surchargePct = input.surcharge_pct ?? input.payment?.surcharge_pct ?? null;
+  const depositArs = input.deposit_ars ?? input.payment?.deposit_ars ?? null;
+  const inputTotal = input.total_ars ?? input.payment?.total_ars ?? null;
+  const items = buildItems(input.items);
+  const serverTotal = computeServerTotal(items);
+
+  return {
+    sale_date: input.sale_date,
+    customer: input.customer,
+    customer_id: input.customer_id,
+    payment_method: paymentMethod,
+    card_brand: cardBrand,
+    installments,
+    surcharge_pct: surchargePct,
+    deposit_ars: depositArs,
+    total_ars: serverTotal,
+    input_total_ars: inputTotal,
+    items,
+    payment: input.payment,
+    trade_in: input.trade_in
+  };
+}
+
+function normalizePatchPayload(input: z.infer<typeof salePatchSchema>): NormalizedPatchPayload {
+  const payload: NormalizedPatchPayload = {};
+
+  if (input.sale_date !== undefined) payload.sale_date = input.sale_date;
+  if (input.customer !== undefined) payload.customer = input.customer;
+  if (input.customer_id !== undefined) payload.customer_id = input.customer_id;
+
+  const paymentMethod = input.payment_method ?? input.payment?.method;
+  const cardBrand = input.card_brand ?? input.payment?.card_brand;
+  const installments = input.installments ?? input.payment?.installments;
+  const surchargePct = input.surcharge_pct ?? input.payment?.surcharge_pct;
+  const depositArs = input.deposit_ars ?? input.payment?.deposit_ars;
+  const inputTotal = input.total_ars ?? input.payment?.total_ars;
+
+  if (paymentMethod !== undefined) payload.payment_method = paymentMethod;
+  if (cardBrand !== undefined) payload.card_brand = cardBrand;
+  if (installments !== undefined) payload.installments = installments;
+  if (surchargePct !== undefined) payload.surcharge_pct = surchargePct;
+  if (depositArs !== undefined) payload.deposit_ars = depositArs;
+  if (inputTotal !== undefined) {
+    payload.total_ars = inputTotal;
+    payload.input_total_ars = inputTotal;
+  }
+
+  if (input.items !== undefined) {
+    payload.items = buildItems(input.items);
+  }
+
+  return payload;
+}
+
+function mapRpcError(error: RpcLikeError): { status: number; code: string; message: string } {
+  const message = (error.message ?? 'rpc_failed').toLowerCase();
+
+  if (message.includes('total_mismatch')) {
+    return { status: 422, code: 'total_mismatch', message: 'Provided total_ars does not match server total' };
+  }
+  if (message.includes('not_found')) {
+    return { status: 404, code: 'not_found', message: 'Resource not found' };
+  }
+  if (message.includes('stock_unavailable') || message.includes('conflict')) {
+    return { status: 409, code: 'conflict', message: 'Resource conflict' };
+  }
+  if (message.includes('validation_error')) {
+    return { status: 422, code: 'validation_error', message: 'Validation failed' };
+  }
+
+  return { status: 400, code: 'rpc_failed', message: 'Operation failed' };
+}
+
+async function persistIdempotencyResult(idempotencyId: string | null, status: number, body: unknown): Promise<void> {
+  if (!idempotencyId) return;
+
+  await supabaseAdmin
+    .from('idempotency_keys')
+    .update({
+      response_status: status,
+      response_body: body
+    })
+    .eq('id', idempotencyId);
+}
+
+function makeError(code: string, message: string, details?: unknown) {
+  return { error: { code, message, details } };
+}
 
 router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('sales')
-    .select('*, customers(name, phone), sale_items(stock_item_id, stock_items(model, imei))')
+    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei))')
     .order('created_at', { ascending: false });
 
   if (error) {
-    return res.status(400).json({
-      error: { code: 'sales_fetch_failed', message: 'Sales fetch failed', details: error.message }
-    });
+    return res.status(400).json(makeError('sales_fetch_failed', 'Sales fetch failed', error.message));
   }
 
   const rows = (data ?? []).flatMap((sale) => {
     const items = sale.sale_items ?? [];
     const customerName = sale.customers?.name ?? null;
     const customerPhone = sale.customers?.phone ?? null;
+
     if (items.length === 0) {
-      return [
-        {
-          ...sale,
-          stock_item_id: null,
-          stock_model: null,
-          stock_imei: null,
-          customer_name: customerName,
-          customer_phone: customerPhone
-        }
-      ];
+      return [{
+        ...sale,
+        stock_item_id: null,
+        stock_model: null,
+        stock_imei: null,
+        qty: null,
+        sale_price_ars_item: null,
+        subtotal_ars_item: null,
+        customer_name: customerName,
+        customer_phone: customerPhone
+      }];
     }
 
-    return items.map((item: { stock_item_id: string; stock_items?: { model: string | null; imei: string | null } }) => ({
+    return items.map((item: {
+      stock_item_id: string;
+      qty: number | null;
+      sale_price_ars: number | null;
+      subtotal_ars: number | null;
+      stock_items?: { model: string | null; imei: string | null };
+    }) => ({
       ...sale,
       stock_item_id: item.stock_item_id,
       stock_model: item.stock_items?.model ?? null,
       stock_imei: item.stock_items?.imei ?? null,
+      qty: item.qty,
+      sale_price_ars_item: item.sale_price_ars,
+      subtotal_ars_item: item.subtotal_ars,
       customer_name: customerName,
       customer_phone: customerPhone
     }));
@@ -82,251 +335,236 @@ router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
   return res.json({ sales: rows });
 });
 
-router.post('/', requireRole('admin', 'seller'), async (req, res) => {
-  const parsed = saleSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: { code: 'validation_error', message: 'Invalid sale payload', details: parsed.error.flatten() }
-    });
-  }
+router.get('/:id', requireRole('admin', 'seller'), async (req, res) => {
+  const saleId = req.params.id;
 
-  const payload = parsed.data;
-
-  // 1) Upsert customer by phone
-  const { data: existingCustomer, error: existingCustomerError } = await supabaseAdmin
-    .from('customers')
-    .select('id')
-    .eq('phone', payload.customer.phone)
-    .maybeSingle();
-
-  if (existingCustomerError) {
-    return res.status(400).json({
-      error: { code: 'customer_lookup_failed', message: 'Customer lookup failed', details: existingCustomerError.message }
-    });
-  }
-
-  let customerId = existingCustomer?.id;
-  if (!customerId) {
-    const { data: newCustomer, error: newCustomerError } = await supabaseAdmin
-      .from('customers')
-      .insert({ name: payload.customer.name, phone: payload.customer.phone })
-      .select('id')
-      .single();
-
-    if (newCustomerError || !newCustomer) {
-      return res.status(400).json({
-        error: { code: 'customer_create_failed', message: 'Customer create failed', details: newCustomerError?.message }
-      });
-    }
-    customerId = newCustomer.id;
-  } else {
-    // Keep name fresh
-    await supabaseAdmin.from('customers').update({ name: payload.customer.name }).eq('id', customerId);
-  }
-
-  // 2) Validate stock items
-  const stockIds = payload.items.map((item) => item.stock_item_id);
-  const { data: stockItems, error: stockError } = await supabaseAdmin
-    .from('stock_items')
-    .select('id, status, warranty_days, warranty_days_default')
-    .in('id', stockIds);
-
-  if (stockError) {
-    return res.status(400).json({
-      error: { code: 'stock_lookup_failed', message: 'Stock lookup failed', details: stockError.message }
-    });
-  }
-
-  const stockById = new Map((stockItems ?? []).map((item) => [item.id, item]));
-  const missing = stockIds.filter((id) => !stockById.has(id));
-  if (missing.length > 0) {
-    return res.status(400).json({
-      error: { code: 'stock_missing', message: 'Some stock items do not exist', details: missing }
-    });
-  }
-
-  const unavailable = (stockItems ?? []).filter((item) => item.status !== 'available');
-  if (unavailable.length > 0) {
-    return res.status(400).json({
-      error: {
-        code: 'stock_unavailable',
-        message: 'Some stock items are not available',
-        details: unavailable.map((item) => ({ id: item.id, status: item.status }))
-      }
-    });
-  }
-
-  // 3) Create sale
   const { data: sale, error: saleError } = await supabaseAdmin
     .from('sales')
-    .insert({
-      sale_date: payload.sale_date,
-      customer_id: customerId,
-      payment_method: payload.payment.method,
-      card_brand: payload.payment.card_brand ?? null,
-      installments: payload.payment.installments ?? null,
-      surcharge_pct: payload.payment.surcharge_pct ?? null,
-      deposit_ars: payload.payment.deposit_ars ?? null,
-      total_ars: payload.payment.total_ars
-    })
-    .select('id')
+    .select('*, customers(name, phone), sale_items(*, stock_items(*)), trade_ins(*)')
+    .eq('id', saleId)
     .single();
 
   if (saleError || !sale) {
-    return res.status(400).json({
-      error: { code: 'sale_create_failed', message: 'Sale create failed', details: saleError?.message }
-    });
+    return res.status(404).json(makeError('not_found', 'Sale not found', saleError?.message));
   }
 
-  const saleId = sale.id;
+  const { data: auditLogs } = await supabaseAdmin
+    .from('sale_audit_logs')
+    .select('id, action, actor_user_id, reason, payload, created_at')
+    .eq('sale_id', saleId)
+    .order('created_at', { ascending: false });
 
-  // 4) Create sale items
-  const saleItemsPayload = payload.items.map((item) => ({
-    sale_id: saleId,
-    stock_item_id: item.stock_item_id,
-    sale_price_ars: item.sale_price_ars
-  }));
-
-  const { error: saleItemsError } = await supabaseAdmin.from('sale_items').insert(saleItemsPayload);
-  if (saleItemsError) {
-    return res.status(400).json({
-      error: { code: 'sale_items_create_failed', message: 'Sale items create failed', details: saleItemsError.message }
-    });
-  }
-
-  // 5) Mark stock as sold
-  const { error: stockUpdateError } = await supabaseAdmin
-    .from('stock_items')
-    .update({ status: 'sold' })
-    .in('id', stockIds);
-
-  if (stockUpdateError) {
-    return res.status(400).json({
-      error: { code: 'stock_update_failed', message: 'Stock status update failed', details: stockUpdateError.message }
-    });
-  }
-
-  // 6) Create warranties (best effort if table exists)
-  const warrantyRows = (stockItems ?? []).map((item) => {
-    const warrantyDays = Number(item.warranty_days ?? item.warranty_days_default ?? 90);
-    const start = new Date(payload.sale_date);
-    const end = new Date(start);
-    end.setDate(end.getDate() + warrantyDays);
-    const startIso = start.toISOString();
-    const endIso = end.toISOString();
-    return {
-      sale_id: saleId,
-      stock_item_id: item.id,
-      customer_id: customerId,
-      start_date: startIso,
-      end_date: endIso,
-      warranty_days: warrantyDays,
-      warranty_start: startIso,
-      warranty_end: endIso
-    };
+  return res.json({
+    sale: {
+      ...sale,
+      audit_logs: auditLogs ?? []
+    }
   });
+});
 
-  const { error: warrantyError } = await supabaseAdmin.from('warranties').insert(warrantyRows);
-  if (warrantyError) {
-    return res.status(400).json({
-      error: { code: 'warranty_create_failed', message: 'Warranty create failed', details: warrantyError.message }
-    });
+router.post('/', requireRole('admin', 'seller'), async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
   }
 
-  // 7) Trade-in (optional)
-  let tradeInId: string | null = null;
-  if (payload.trade_in?.enabled) {
-    const { data: tradeIn, error: tradeInError } = await supabaseAdmin
-      .from('trade_ins')
+  const parsed = saleCreateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', parsed.error.flatten()));
+  }
+
+  const normalized = normalizeCreatePayload(parsed.data);
+  if (normalized.input_total_ars != null && Math.abs(normalized.input_total_ars - normalized.total_ars) > 0.01) {
+    return res.status(422).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
+      input_total_ars: normalized.input_total_ars,
+      server_total_ars: normalized.total_ars
+    }));
+  }
+
+  const idempotencyKey = req.header('x-idempotency-key')?.trim();
+  const requestHash = hashPayload(normalized);
+  let idempotencyId: string | null = null;
+
+  if (idempotencyKey) {
+    const findExisting = async () => supabaseAdmin
+      .from('idempotency_keys')
+      .select('id, request_hash, response_status, response_body')
+      .eq('user_id', userId)
+      .eq('route', IDEMPOTENCY_ROUTE)
+      .eq('key', idempotencyKey)
+      .maybeSingle();
+
+    const { data: existing, error: existingError } = await findExisting();
+    if (existingError) {
+      return res.status(400).json(makeError('idempotency_lookup_failed', 'Failed to lookup idempotency key', existingError.message));
+    }
+
+    if (existing) {
+      if (existing.request_hash !== requestHash) {
+        return res.status(409).json(makeError('idempotency_conflict', 'Same idempotency key used with different payload'));
+      }
+
+      if (existing.response_status && existing.response_body) {
+        return res.status(existing.response_status).json(existing.response_body);
+      }
+
+      return res.status(409).json(makeError('idempotency_in_progress', 'Request with this idempotency key is in progress'));
+    }
+
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const { data: inserted, error: insertError } = await supabaseAdmin
+      .from('idempotency_keys')
       .insert({
-        sale_id: saleId,
-        device: payload.trade_in.device,
-        trade_value_usd: payload.trade_in.trade_value_usd,
-        fx_rate_used: payload.trade_in.fx_rate_used,
-        status: 'valued'
+        user_id: userId,
+        route: IDEMPOTENCY_ROUTE,
+        key: idempotencyKey,
+        request_hash: requestHash,
+        expires_at: expiresAt
       })
       .select('id')
       .single();
 
-    if (tradeInError || !tradeIn) {
-      return res.status(400).json({
-        error: { code: 'trade_in_create_failed', message: 'Trade-in create failed', details: tradeInError?.message }
-      });
+    if (insertError) {
+      if (insertError.code === '23505') {
+        const { data: raced, error: racedError } = await findExisting();
+        if (racedError) {
+          return res.status(400).json(makeError('idempotency_lookup_failed', 'Failed to lookup idempotency key', racedError.message));
+        }
+        if (raced) {
+          if (raced.request_hash !== requestHash) {
+            return res.status(409).json(makeError('idempotency_conflict', 'Same idempotency key used with different payload'));
+          }
+          if (raced.response_status && raced.response_body) {
+            return res.status(raced.response_status).json(raced.response_body);
+          }
+          return res.status(409).json(makeError('idempotency_in_progress', 'Request with this idempotency key is in progress'));
+        }
+      }
+
+      return res.status(400).json(makeError('idempotency_reserve_failed', 'Failed to reserve idempotency key', insertError.message));
     }
-    tradeInId = tradeIn.id;
+
+    idempotencyId = inserted?.id ?? null;
   }
 
-  return res.status(201).json({
-    sale_id: saleId,
-    trade_in_id: tradeInId,
-    customer_id: customerId
+  const rpcPayload = {
+    ...normalized,
+    total_ars: normalized.total_ars
+  };
+
+  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_create_sale_v2', {
+    p_payload: rpcPayload,
+    p_user_id: userId
+  });
+
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    const body = makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message);
+    await persistIdempotencyResult(idempotencyId, mapped.status, body);
+    return res.status(mapped.status).json(body);
+  }
+
+  const responseBody = {
+    sale_id: rpcData?.sale_id,
+    trade_in_id: rpcData?.trade_in_id ?? null,
+    customer_id: rpcData?.customer_id,
+    total_ars: Number(rpcData?.total_ars ?? normalized.total_ars),
+    server_total_ars: Number(rpcData?.server_total_ars ?? normalized.total_ars)
+  };
+
+  await persistIdempotencyResult(idempotencyId, 201, responseBody);
+  return res.status(201).json(responseBody);
+});
+
+router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
+  }
+
+  const parsed = salePatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid patch payload', parsed.error.flatten()));
+  }
+
+  const normalized = normalizePatchPayload(parsed.data);
+
+  if (normalized.items && normalized.total_ars != null) {
+    const serverTotal = computeServerTotal(normalized.items);
+    if (Math.abs(serverTotal - normalized.total_ars) > 0.01) {
+      return res.status(422).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
+        input_total_ars: normalized.total_ars,
+        server_total_ars: serverTotal
+      }));
+    }
+  }
+
+  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_update_sale_v2', {
+    p_sale_id: req.params.id,
+    p_payload: normalized,
+    p_user_id: userId
+  });
+
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
+  }
+
+  return res.json({
+    sale_id: rpcData?.sale_id,
+    customer_id: rpcData?.customer_id,
+    total_ars: Number(rpcData?.total_ars ?? 0),
+    server_total_ars: Number(rpcData?.server_total_ars ?? 0),
+    status: rpcData?.status ?? 'completed'
+  });
+});
+
+router.post('/:id/cancel', requireRole('admin', 'seller'), async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
+  }
+
+  const parsed = cancelSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid cancel payload', parsed.error.flatten()));
+  }
+
+  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_cancel_sale_v2', {
+    p_sale_id: req.params.id,
+    p_reason: parsed.data.reason,
+    p_user_id: userId
+  });
+
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
+  }
+
+  return res.json({
+    sale_id: rpcData?.sale_id,
+    status: rpcData?.status ?? 'cancelled'
   });
 });
 
 router.delete('/:id', requireRole('admin'), async (req, res) => {
-  const saleId = req.params.id;
-
-  // Load related sale items to restore stock
-  const { data: saleItems, error: saleItemsError } = await supabaseAdmin
-    .from('sale_items')
-    .select('stock_item_id')
-    .eq('sale_id', saleId);
-
-  if (saleItemsError) {
-    return res.status(400).json({
-      error: { code: 'sale_items_fetch_failed', message: 'Sale items fetch failed', details: saleItemsError.message }
-    });
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
   }
 
-  const stockIds = (saleItems ?? []).map((item) => item.stock_item_id).filter(Boolean);
+  const { error: rpcError } = await supabaseAdmin.rpc('rpc_cancel_sale_v2', {
+    p_sale_id: req.params.id,
+    p_reason: 'legacy_delete_endpoint',
+    p_user_id: userId
+  });
 
-  const { error: warrantiesError } = await supabaseAdmin.from('warranties').delete().eq('sale_id', saleId);
-  if (warrantiesError) {
-    return res.status(400).json({
-      error: { code: 'warranties_delete_failed', message: 'Warranties delete failed', details: warrantiesError.message }
-    });
-  }
-
-  const { error: tradeInsError } = await supabaseAdmin.from('trade_ins').delete().eq('sale_id', saleId);
-  if (tradeInsError) {
-    return res.status(400).json({
-      error: { code: 'trade_ins_delete_failed', message: 'Trade-ins delete failed', details: tradeInsError.message }
-    });
-  }
-
-  const { error: saleItemsDeleteError } = await supabaseAdmin.from('sale_items').delete().eq('sale_id', saleId);
-  if (saleItemsDeleteError) {
-    return res.status(400).json({
-      error: { code: 'sale_items_delete_failed', message: 'Sale items delete failed', details: saleItemsDeleteError.message }
-    });
-  }
-
-  const { error: saleDeleteError, count } = await supabaseAdmin
-    .from('sales')
-    .delete({ count: 'exact' })
-    .eq('id', saleId);
-
-  if (saleDeleteError) {
-    return res.status(400).json({
-      error: { code: 'sale_delete_failed', message: 'Sale delete failed', details: saleDeleteError.message }
-    });
-  }
-
-  if (!count) {
-    return res.status(404).json({ error: { code: 'not_found', message: 'Sale not found' } });
-  }
-
-  if (stockIds.length > 0) {
-    const { error: stockRestoreError } = await supabaseAdmin
-      .from('stock_items')
-      .update({ status: 'available' })
-      .in('id', stockIds);
-
-    if (stockRestoreError) {
-      return res.status(400).json({
-        error: { code: 'stock_restore_failed', message: 'Stock restore failed', details: stockRestoreError.message }
-      });
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    if (mapped.status === 404) {
+      return res.status(404).json(makeError('not_found', 'Sale not found'));
     }
+    return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
   }
 
   return res.status(204).send();
