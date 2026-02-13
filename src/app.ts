@@ -1,5 +1,10 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { authMiddleware } from './middleware/auth.js';
 import { salesRouter } from './modules/sales/index.js';
 import { tradeInsRouter } from './modules/tradeins/index.js';
@@ -10,10 +15,110 @@ import { stockItemsRouter } from './modules/stockItems/index.js';
 
 export const app = express();
 
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+function parsePositiveInt(rawValue: string | undefined, fallback: number): number {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+const configuredOrigins = (process.env.CORS_ORIGINS ?? '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedOrigins = new Set<string>([
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+  ...configuredOrigins
+]);
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type'],
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  optionsSuccessStatus: 204
+};
+
+const rateLimitWindowMin = parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MIN, 15);
+const rateLimitWindowMs = rateLimitWindowMin * 60 * 1000;
+const globalRateLimitMax = parsePositiveInt(process.env.RATE_LIMIT_MAX, 300);
+const adminRateLimitMax = parsePositiveInt(process.env.RATE_LIMIT_ADMIN_MAX, 60);
+
+const globalRateLimit = rateLimit({
+  windowMs: rateLimitWindowMs,
+  max: globalRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: {
+      code: 'rate_limited',
+      message: 'Too many requests, please try again later.'
+    }
+  }
+});
+
+const adminUsersRateLimit = rateLimit({
+  windowMs: rateLimitWindowMs,
+  max: adminRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: {
+      code: 'rate_limited',
+      message: 'Too many admin requests, please try again later.'
+    }
+  }
+});
+
+const packagePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+const appVersion = (() => {
+  try {
+    const packageJson = JSON.parse(readFileSync(packagePath, 'utf8')) as { version?: unknown };
+    return typeof packageJson.version === 'string' ? packageJson.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
+
+const runtimeEnv = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
+
+app.use((req, res, next) => {
+  const origin = req.header('origin');
+  if (!origin || allowedOrigins.has(origin)) {
+    return next();
+  }
+
+  return res.status(403).json({
+    error: {
+      code: 'cors_forbidden',
+      message: 'Origin not allowed'
+    }
+  });
+});
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '1mb' }));
+app.use(globalRateLimit);
+
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  version: appVersion,
+  timestamp: new Date().toISOString(),
+  env: runtimeEnv
+}));
 
 app.use('/api', authMiddleware);
 
@@ -21,7 +126,7 @@ app.use('/api/sales', salesRouter);
 app.use('/api/trade-ins', tradeInsRouter);
 app.use('/api/installment-rules', installmentRulesRouter);
 app.use('/api/finance', financeRouter);
-app.use('/api/admin/users', adminUsersRouter);
+app.use('/api/admin/users', adminUsersRateLimit, adminUsersRouter);
 app.use('/api/stock-items', stockItemsRouter);
 
 app.use((req, res) => {
