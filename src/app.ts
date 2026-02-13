@@ -23,15 +23,10 @@ function parsePositiveInt(rawValue: string | undefined, fallback: number): numbe
   return Math.floor(parsed);
 }
 
-const configuredOrigins = (process.env.CORS_ORIGINS ?? '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
 const allowedOrigins = new Set<string>([
-  'http://localhost:4173',
-  'http://127.0.0.1:4173',
-  ...configuredOrigins
+  'https://myphonetuc.netlify.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
 ]);
 
 const corsOptions: cors.CorsOptions = {
@@ -39,11 +34,11 @@ const corsOptions: cors.CorsOptions = {
     if (!origin || allowedOrigins.has(origin)) {
       return callback(null, true);
     }
-    return callback(new Error('Origin not allowed by CORS'));
+    return callback(new Error('Origin not allowed'));
   },
   credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type'],
-  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   optionsSuccessStatus: 204
 };
 
@@ -95,21 +90,8 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-app.use((req, res, next) => {
-  const origin = req.header('origin');
-  if (!origin || allowedOrigins.has(origin)) {
-    return next();
-  }
-
-  return res.status(403).json({
-    error: {
-      code: 'cors_forbidden',
-      message: 'Origin not allowed'
-    }
-  });
-});
-
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 app.use(globalRateLimit);
 
@@ -135,5 +117,8 @@ app.use((req, res) => {
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (err instanceof Error && err.message === 'Origin not allowed') {
+    return res.status(403).json({ error: { code: 'cors_forbidden', message: 'Origin not allowed' } });
+  }
   res.status(500).json({ error: { code: 'internal_error', message: 'Unexpected error', details: String(err) } });
 });
