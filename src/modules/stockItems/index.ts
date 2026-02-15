@@ -7,6 +7,17 @@ const router = Router();
 
 const conditionEnum = z.enum(['new', 'like_new', 'used', 'outlet']);
 
+function logValidationError(details: unknown): void {
+  // eslint-disable-next-line no-console
+  console.error(JSON.stringify({
+    level: 'warn',
+    event: 'validation_error',
+    scope: 'stock-items.create',
+    details,
+    timestamp: new Date().toISOString()
+  }));
+}
+
 const createSchema = z
   .object({
     brand: z.string().min(1),
@@ -24,8 +35,13 @@ const createSchema = z
     color: z.string().nullable().optional(),
     color_other: z.string().nullable().optional(),
     imei: z.string().nullable().optional(),
+    provider_name: z.string().min(1).nullable().optional(),
+    details: z.string().nullable().optional(),
+    received_at: z.string().datetime().nullable().optional(),
+    is_promo: z.boolean().optional(),
+    is_sealed: z.boolean().optional(),
     notes: z.string().nullable().optional(),
-    status: z.enum(['available', 'reserved', 'sold']).optional()
+    status: z.enum(['available', 'reserved', 'sold', 'service_tech', 'drawer']).optional()
   })
   .refine(
     (data) =>
@@ -37,6 +53,7 @@ const createSchema = z
 router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError(parsed.error.flatten());
     return res.status(400).json({
       error: { code: 'validation_error', message: 'Invalid stock item payload', details: parsed.error.flatten() }
     });
@@ -63,6 +80,11 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     color: payload.color ?? null,
     color_other: payload.color_other ?? null,
     imei: payload.imei ?? null,
+    provider_name: payload.provider_name ?? null,
+    details: payload.details ?? null,
+    received_at: payload.received_at ?? null,
+    is_promo: payload.is_promo ?? false,
+    is_sealed: payload.is_sealed ?? false,
     notes: payload.notes ?? null,
     status: payload.status ?? 'available',
     trade_in_id: null

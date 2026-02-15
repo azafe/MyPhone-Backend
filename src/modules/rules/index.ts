@@ -5,10 +5,22 @@ import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
 
+function logValidationError(details: unknown): void {
+  // eslint-disable-next-line no-console
+  console.error(JSON.stringify({
+    level: 'warn',
+    event: 'validation_error',
+    scope: 'installment-rules',
+    details,
+    timestamp: new Date().toISOString()
+  }));
+}
+
 const ruleSchema = z.object({
   card_brand: z.string().min(1),
   installments: z.number().int().positive(),
   surcharge_pct: z.number().min(0),
+  channel: z.enum(['standard', 'mercado_pago']).default('standard'),
   is_active: z.boolean().default(true)
 });
 
@@ -28,6 +40,7 @@ router.get('/', requireRole('admin'), async (_req, res) => {
 router.post('/', requireRole('admin'), async (req, res) => {
   const parsed = ruleSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError(parsed.error.flatten());
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid rule payload', details: parsed.error.flatten() } });
   }
 
@@ -47,6 +60,7 @@ router.post('/', requireRole('admin'), async (req, res) => {
 router.patch('/:id', requireRole('admin'), async (req, res) => {
   const parsed = ruleSchema.partial().safeParse(req.body);
   if (!parsed.success) {
+    logValidationError(parsed.error.flatten());
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid rule patch', details: parsed.error.flatten() } });
   }
 

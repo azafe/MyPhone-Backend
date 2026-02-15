@@ -5,6 +5,17 @@ import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
 
+function logValidationError(scope: string, details: unknown): void {
+  // eslint-disable-next-line no-console
+  console.error(JSON.stringify({
+    level: 'warn',
+    event: 'validation_error',
+    scope,
+    details,
+    timestamp: new Date().toISOString()
+  }));
+}
+
 const tradeInCreateSchema = z.object({
   device: z.object({
     brand: z.string().min(1),
@@ -17,6 +28,9 @@ const tradeInCreateSchema = z.object({
   trade_value_usd: z.number().min(0),
   fx_rate_used: z.number().min(0),
   status: z.enum(['pending', 'valued']).optional(),
+  sale_ref: z.string().min(1).optional(),
+  customer_name: z.string().min(1).optional(),
+  customer_phone: z.string().min(6).optional(),
   notes: z.string().optional()
 });
 
@@ -24,6 +38,9 @@ const tradeInPatchSchema = z.object({
   trade_value_usd: z.number().min(0).optional(),
   fx_rate_used: z.number().min(0).optional(),
   status: z.enum(['pending', 'valued', 'added_to_stock']).optional(),
+  sale_ref: z.string().min(1).optional(),
+  customer_name: z.string().min(1).optional(),
+  customer_phone: z.string().min(6).optional(),
   notes: z.string().optional()
 });
 
@@ -44,6 +61,7 @@ const convertSchema = z.object({
 router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   const parsed = tradeInCreateSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('trade-ins.create', parsed.error.flatten());
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid trade-in payload', details: parsed.error.flatten() } });
   }
 
@@ -69,6 +87,7 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
 router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
   const parsed = tradeInPatchSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('trade-ins.patch', parsed.error.flatten());
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid trade-in patch', details: parsed.error.flatten() } });
   }
 
@@ -89,6 +108,7 @@ router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
 router.post('/:id/convert-to-stock', requireRole('admin', 'seller'), async (req, res) => {
   const parsed = convertSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('trade-ins.convert', parsed.error.flatten());
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid convert payload', details: parsed.error.flatten() } });
   }
 

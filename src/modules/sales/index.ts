@@ -8,6 +8,7 @@ const router = Router();
 const IDEMPOTENCY_ROUTE = 'POST /api/sales';
 
 const paymentMethodSchema = z.enum(['cash', 'transfer', 'card', 'mixed', 'trade_in']);
+const currencySchema = z.enum(['ARS', 'USD']);
 
 const customerSchema = z.object({
   name: z.string().min(1),
@@ -53,6 +54,12 @@ const saleCreateSchema = z.object({
   surcharge_pct: z.coerce.number().min(0).nullable().optional(),
   deposit_ars: z.coerce.number().min(0).nullable().optional(),
   total_ars: z.coerce.number().positive().optional(),
+  currency: currencySchema.optional(),
+  fx_rate_used: z.coerce.number().positive().nullable().optional(),
+  total_usd: z.coerce.number().positive().nullable().optional(),
+  balance_due_ars: z.coerce.number().min(0).nullable().optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+  includes_cube_20w: z.boolean().optional(),
   items: z.array(saleItemSchema).min(1),
   payment: paymentLegacySchema.optional(),
   trade_in: tradeInSchema.optional()
@@ -77,6 +84,14 @@ const saleCreateSchema = z.object({
     }
     seen.add(item.stock_item_id);
   }
+
+  if ((value.currency ?? 'ARS') === 'USD' && Number(value.fx_rate_used ?? 0) <= 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'fx_rate_used_required_for_usd',
+      path: ['fx_rate_used']
+    });
+  }
 });
 
 const salePatchSchema = z.object({
@@ -89,6 +104,12 @@ const salePatchSchema = z.object({
   surcharge_pct: z.coerce.number().min(0).nullable().optional(),
   deposit_ars: z.coerce.number().min(0).nullable().optional(),
   total_ars: z.coerce.number().positive().optional(),
+  currency: currencySchema.optional(),
+  fx_rate_used: z.coerce.number().positive().nullable().optional(),
+  total_usd: z.coerce.number().positive().nullable().optional(),
+  balance_due_ars: z.coerce.number().min(0).nullable().optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+  includes_cube_20w: z.boolean().optional(),
   items: z.array(saleItemSchema).min(1).optional(),
   payment: paymentLegacySchema.partial().optional()
 }).superRefine((value, ctx) => {
@@ -114,6 +135,14 @@ const salePatchSchema = z.object({
       seen.add(item.stock_item_id);
     }
   }
+
+  if (value.currency === 'USD' && Number(value.fx_rate_used ?? 0) <= 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'fx_rate_used_required_for_usd',
+      path: ['fx_rate_used']
+    });
+  }
 });
 
 const cancelSchema = z.object({
@@ -137,6 +166,12 @@ type NormalizedCreatePayload = {
   deposit_ars: number | null;
   total_ars: number;
   input_total_ars: number | null;
+  currency: z.infer<typeof currencySchema>;
+  fx_rate_used: number | null;
+  total_usd: number | null;
+  balance_due_ars: number;
+  notes: string | null;
+  includes_cube_20w: boolean;
   items: SaleItemInput[];
   payment?: z.infer<typeof paymentLegacySchema>;
   trade_in?: z.infer<typeof tradeInSchema>;
@@ -153,6 +188,12 @@ type NormalizedPatchPayload = {
   deposit_ars?: number | null;
   total_ars?: number;
   input_total_ars?: number | null;
+  currency?: z.infer<typeof currencySchema>;
+  fx_rate_used?: number | null;
+  total_usd?: number | null;
+  balance_due_ars?: number | null;
+  notes?: string | null;
+  includes_cube_20w?: boolean;
   items?: SaleItemInput[];
 };
 
@@ -191,6 +232,23 @@ function computeServerTotal(items: SaleItemInput[]): number {
   return items.reduce((sum, item) => sum + (item.qty * item.sale_price_ars), 0);
 }
 
+function roundTo2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function logValidationError(scope: string, details: unknown, extra?: Record<string, unknown>): void {
+  // Structured log for operational tracing in Railway logs.
+  // eslint-disable-next-line no-console
+  console.error(JSON.stringify({
+    level: 'warn',
+    event: 'validation_error',
+    scope,
+    ...extra,
+    details,
+    timestamp: new Date().toISOString()
+  }));
+}
+
 function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): NormalizedCreatePayload {
   const paymentMethod = input.payment_method ?? input.payment?.method ?? 'cash';
   const cardBrand = input.card_brand ?? input.payment?.card_brand ?? null;
@@ -200,6 +258,13 @@ function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): Normal
   const inputTotal = input.total_ars ?? input.payment?.total_ars ?? null;
   const items = buildItems(input.items);
   const serverTotal = computeServerTotal(items);
+  const currency = input.currency ?? 'ARS';
+  const fxRateUsed = input.fx_rate_used ?? null;
+  const derivedTotalUsd = currency === 'USD' && fxRateUsed && fxRateUsed > 0
+    ? roundTo2(serverTotal / fxRateUsed)
+    : null;
+  const totalUsd = input.total_usd ?? derivedTotalUsd;
+  const balanceDueArs = input.balance_due_ars ?? Math.max(serverTotal - (depositArs ?? 0), 0);
 
   return {
     sale_date: input.sale_date,
@@ -212,6 +277,12 @@ function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): Normal
     deposit_ars: depositArs,
     total_ars: serverTotal,
     input_total_ars: inputTotal,
+    currency,
+    fx_rate_used: fxRateUsed,
+    total_usd: totalUsd,
+    balance_due_ars: balanceDueArs,
+    notes: input.notes ?? null,
+    includes_cube_20w: input.includes_cube_20w ?? false,
     items,
     payment: input.payment,
     trade_in: input.trade_in
@@ -241,6 +312,12 @@ function normalizePatchPayload(input: z.infer<typeof salePatchSchema>): Normaliz
     payload.total_ars = inputTotal;
     payload.input_total_ars = inputTotal;
   }
+  if (input.currency !== undefined) payload.currency = input.currency;
+  if (input.fx_rate_used !== undefined) payload.fx_rate_used = input.fx_rate_used;
+  if (input.total_usd !== undefined) payload.total_usd = input.total_usd;
+  if (input.balance_due_ars !== undefined) payload.balance_due_ars = input.balance_due_ars;
+  if (input.notes !== undefined) payload.notes = input.notes;
+  if (input.includes_cube_20w !== undefined) payload.includes_cube_20w = input.includes_cube_20w;
 
   if (input.items !== undefined) {
     payload.items = buildItems(input.items);
@@ -262,6 +339,9 @@ function mapRpcError(error: RpcLikeError): { status: number; code: string; messa
     return { status: 409, code: 'conflict', message: 'Resource conflict' };
   }
   if (message.includes('validation_error')) {
+    return { status: 422, code: 'validation_error', message: 'Validation failed' };
+  }
+  if (message.includes('invalid_payment_method') || message.includes('invalid_card_brand') || message.includes('invalid_currency')) {
     return { status: 422, code: 'validation_error', message: 'Validation failed' };
   }
 
@@ -370,11 +450,27 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
 
   const parsed = saleCreateSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('sales.create', parsed.error.flatten(), { user_id: userId });
     return res.status(400).json(makeError('validation_error', 'Invalid sale payload', parsed.error.flatten()));
   }
 
   const normalized = normalizeCreatePayload(parsed.data);
+  if (normalized.currency === 'USD' && Number(normalized.fx_rate_used ?? 0) <= 0) {
+    logValidationError('sales.create', 'fx_rate_used_required_for_usd', { user_id: userId });
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'fx_rate_used_required_for_usd'));
+  }
+
+  if (normalized.total_ars <= 0) {
+    logValidationError('sales.create', 'total_ars_must_be_gt_0', { user_id: userId });
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'total_ars_must_be_gt_0'));
+  }
+
   if (normalized.input_total_ars != null && Math.abs(normalized.input_total_ars - normalized.total_ars) > 0.01) {
+    logValidationError('sales.create', 'total_mismatch', {
+      user_id: userId,
+      input_total_ars: normalized.input_total_ars,
+      server_total_ars: normalized.total_ars
+    });
     return res.status(422).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
       input_total_ars: normalized.input_total_ars,
       server_total_ars: normalized.total_ars
@@ -469,7 +565,13 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     trade_in_id: rpcData?.trade_in_id ?? null,
     customer_id: rpcData?.customer_id,
     total_ars: Number(rpcData?.total_ars ?? normalized.total_ars),
-    server_total_ars: Number(rpcData?.server_total_ars ?? normalized.total_ars)
+    server_total_ars: Number(rpcData?.server_total_ars ?? normalized.total_ars),
+    currency: rpcData?.currency ?? normalized.currency,
+    fx_rate_used: rpcData?.fx_rate_used ?? normalized.fx_rate_used,
+    total_usd: rpcData?.total_usd ?? normalized.total_usd,
+    balance_due_ars: rpcData?.balance_due_ars ?? normalized.balance_due_ars,
+    notes: rpcData?.notes ?? normalized.notes,
+    includes_cube_20w: rpcData?.includes_cube_20w ?? normalized.includes_cube_20w
   };
 
   await persistIdempotencyResult(idempotencyId, 201, responseBody);
@@ -484,14 +586,25 @@ router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
 
   const parsed = salePatchSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('sales.patch', parsed.error.flatten(), { user_id: userId, sale_id: req.params.id });
     return res.status(400).json(makeError('validation_error', 'Invalid patch payload', parsed.error.flatten()));
   }
 
   const normalized = normalizePatchPayload(parsed.data);
+  if (normalized.currency === 'USD' && Number(normalized.fx_rate_used ?? 0) <= 0) {
+    logValidationError('sales.patch', 'fx_rate_used_required_for_usd', { user_id: userId, sale_id: req.params.id });
+    return res.status(422).json(makeError('validation_error', 'Invalid patch payload', 'fx_rate_used_required_for_usd'));
+  }
 
   if (normalized.items && normalized.total_ars != null) {
     const serverTotal = computeServerTotal(normalized.items);
     if (Math.abs(serverTotal - normalized.total_ars) > 0.01) {
+      logValidationError('sales.patch', 'total_mismatch', {
+        user_id: userId,
+        sale_id: req.params.id,
+        input_total_ars: normalized.total_ars,
+        server_total_ars: serverTotal
+      });
       return res.status(422).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
         input_total_ars: normalized.total_ars,
         server_total_ars: serverTotal
@@ -515,7 +628,13 @@ router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
     customer_id: rpcData?.customer_id,
     total_ars: Number(rpcData?.total_ars ?? 0),
     server_total_ars: Number(rpcData?.server_total_ars ?? 0),
-    status: rpcData?.status ?? 'completed'
+    status: rpcData?.status ?? 'completed',
+    currency: rpcData?.currency ?? null,
+    fx_rate_used: rpcData?.fx_rate_used ?? null,
+    total_usd: rpcData?.total_usd ?? null,
+    balance_due_ars: rpcData?.balance_due_ars ?? null,
+    notes: rpcData?.notes ?? null,
+    includes_cube_20w: rpcData?.includes_cube_20w ?? false
   });
 });
 
@@ -527,6 +646,7 @@ router.post('/:id/cancel', requireRole('admin', 'seller'), async (req, res) => {
 
   const parsed = cancelSchema.safeParse(req.body);
   if (!parsed.success) {
+    logValidationError('sales.cancel', parsed.error.flatten(), { user_id: userId, sale_id: req.params.id });
     return res.status(400).json(makeError('validation_error', 'Invalid cancel payload', parsed.error.flatten()));
   }
 

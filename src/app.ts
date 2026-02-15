@@ -12,6 +12,7 @@ import { installmentRulesRouter } from './modules/rules/index.js';
 import { financeRouter } from './modules/finance/index.js';
 import { adminUsersRouter } from './modules/adminUsers/index.js';
 import { stockItemsRouter } from './modules/stockItems/index.js';
+import { planCanjeValuesRouter } from './modules/planCanjeValues/index.js';
 
 export const app = express();
 
@@ -29,9 +30,17 @@ const allowedOrigins = new Set<string>([
   'http://127.0.0.1:5173'
 ]);
 
+function isAllowedOrigin(origin: string): boolean {
+  if (allowedOrigins.has(origin)) {
+    return true;
+  }
+
+  return /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin);
+}
+
 const corsOptions: cors.CorsOptions = {
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
+    if (!origin || isAllowedOrigin(origin)) {
       return callback(null, true);
     }
     return callback(new Error('Origin not allowed'));
@@ -110,6 +119,7 @@ app.use('/api/installment-rules', installmentRulesRouter);
 app.use('/api/finance', financeRouter);
 app.use('/api/admin/users', adminUsersRateLimit, adminUsersRouter);
 app.use('/api/stock-items', stockItemsRouter);
+app.use('/api/plan-canje-values', planCanjeValuesRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: { code: 'not_found', message: `Route not found: ${req.method} ${req.path}` } });
