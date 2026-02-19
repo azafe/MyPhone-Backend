@@ -10,7 +10,8 @@
     "start": "node dist/server.js",
     "seed:users": "tsx scripts/seed-initial-users.ts",
     "test:lote7:smoke": "node scripts/test-lote7-smoke.mjs",
-    "test:mvp:atomic": "node scripts/test-mvp-atomic-role.mjs"
+    "test:mvp:atomic": "node scripts/test-mvp-atomic-role.mjs",
+    "test:finance:summary": "node scripts/test-finance-summary.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

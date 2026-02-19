@@ -22,6 +22,71 @@ type PaymentMixRow = {
   total: number;
 };
 
+type SummarySaleItemRow = {
+  qty: number | null;
+  sale_price_ars: number | null;
+  subtotal_ars: number | null;
+  unit_cost_ars: number | null;
+  stock_items?: { purchase_ars: number | null } | Array<{ purchase_ars: number | null }> | null;
+};
+
+const SALE_ITEMS_TO_SALES_FK_CANDIDATES = [
+  'sale_items_sale_id_fkey',
+  'sale_items_sale_id_fk'
+] as const;
+const SALE_ITEMS_TO_STOCK_ITEMS_FK_CANDIDATES = [
+  'sale_items_stock_item_id_fkey',
+  'sale_items_stock_item_id_fk'
+] as const;
+
+type FinanceErrorLike = {
+  code?: string;
+  message?: string;
+  details?: string;
+  hint?: string;
+};
+
+function formatFinanceErrorDetails(error: FinanceErrorLike): string {
+  const parts = [
+    error.code,
+    error.message,
+    error.hint
+  ].filter((value): value is string => Boolean(value && value.trim()));
+
+  return parts.join(' | ') || 'unknown_error';
+}
+
+async function fetchSaleItemsForSummary(from: string, to: string) {
+  let lastError: FinanceErrorLike | null = null;
+
+  for (const salesFkName of SALE_ITEMS_TO_SALES_FK_CANDIDATES) {
+    for (const stockFkName of SALE_ITEMS_TO_STOCK_ITEMS_FK_CANDIDATES) {
+      const { data, error } = await supabaseAdmin
+        .from('sale_items')
+        .select(`qty, sale_price_ars, subtotal_ars, unit_cost_ars, stock_items!${stockFkName}(purchase_ars), sales!${salesFkName}!inner(sale_date, status)`)
+        .gte('sales.sale_date', `${from}T00:00:00Z`)
+        .lte('sales.sale_date', `${to}T23:59:59Z`)
+        .eq('sales.status', 'completed');
+
+      if (!error) {
+        return {
+          data: (data ?? []) as SummarySaleItemRow[],
+          fkName: `${salesFkName}|${stockFkName}`,
+          error: null as FinanceErrorLike | null
+        };
+      }
+
+      lastError = error;
+      const relationMissing = error.code === 'PGRST200' || error.code === 'PGRST201';
+      if (!relationMissing) {
+        break;
+      }
+    }
+  }
+
+  return { data: null as SummarySaleItemRow[] | null, fkName: null as string | null, error: lastError };
+}
+
 router.get('/summary', requireRole('admin'), async (req, res) => {
   const parsed = querySchema.safeParse(req.query);
   if (!parsed.success) {
@@ -41,15 +106,16 @@ router.get('/summary', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: { code: 'finance_fetch_failed', message: 'Sales query failed', details: salesError.message } });
   }
 
-  const { data: saleItems, error: itemsError } = await supabaseAdmin
-    .from('sale_items')
-    .select('qty, sale_price_ars, subtotal_ars, unit_cost_ars, stock_items(purchase_ars), sales!inner(sale_date, status)')
-    .gte('sales.sale_date', `${from}T00:00:00Z`)
-    .lte('sales.sale_date', `${to}T23:59:59Z`)
-    .eq('sales.status', 'completed');
+  const { data: saleItems, error: itemsError } = await fetchSaleItemsForSummary(from, to);
 
   if (itemsError) {
-    return res.status(400).json({ error: { code: 'finance_fetch_failed', message: 'Sale items query failed', details: itemsError.message } });
+    return res.status(400).json({
+      error: {
+        code: 'finance_fetch_failed',
+        message: 'Sale items query failed',
+        details: formatFinanceErrorDetails(itemsError)
+      }
+    });
   }
 
   const sales_total = (sales ?? []).reduce((sum, sale) => sum + Number(sale.total_ars ?? 0), 0);
