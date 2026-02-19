@@ -5,6 +5,16 @@ import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
 
+const ROLE_RANK = {
+  seller: 1,
+  admin: 2,
+  owner: 3
+} as const;
+
+function isManagedRole(role: unknown): role is keyof typeof ROLE_RANK {
+  return role === 'seller' || role === 'admin' || role === 'owner';
+}
+
 const createSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
@@ -25,8 +35,11 @@ router.post('/', requireRole('admin'), async (req, res) => {
 
   const { email, password, full_name, role } = parsed.data;
   const actorRole = req.user?.role ?? null;
+  if (role === 'admin' && actorRole !== 'owner') {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can promote users to admin' } });
+  }
   if (role === 'owner' && actorRole !== 'owner') {
-    return res.status(403).json({ error: { code: 'forbidden', message: 'Only owner can assign owner role' } });
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can assign owner role' } });
   }
 
   const { data: userData, error: userError } = await supabaseAdmin.auth.admin.createUser({
@@ -69,15 +82,38 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid patch payload', details: parsed.error.flatten() } });
   }
 
-  if (parsed.data.role === 'owner' && req.user?.role !== 'owner') {
-    return res.status(403).json({ error: { code: 'forbidden', message: 'Only owner can assign owner role' } });
-  }
-
   const { data: beforeProfile } = await supabaseAdmin
     .from('profiles')
     .select('role, full_name')
     .eq('id', req.params.id)
     .maybeSingle();
+
+  if (!beforeProfile) {
+    return res.status(404).json({ error: { code: 'not_found', message: 'Profile not found' } });
+  }
+
+  const desiredRole = parsed.data.role;
+  const actorRole = req.user?.role ?? null;
+  const targetRole = beforeProfile.role;
+  if (!isManagedRole(targetRole)) {
+    return res.status(409).json({ error: { code: 'protected_role', message: 'Target profile role is protected' } });
+  }
+
+  if (targetRole === 'owner' && desiredRole && desiredRole !== 'owner') {
+    return res.status(409).json({ error: { code: 'protected_role', message: 'Owner role cannot be changed via this endpoint' } });
+  }
+
+  if (req.user?.id === req.params.id && desiredRole && ROLE_RANK[desiredRole] < ROLE_RANK[targetRole]) {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'You cannot self-demote your role' } });
+  }
+
+  if (desiredRole === 'admin' && targetRole !== 'admin' && actorRole !== 'owner') {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can promote users to admin' } });
+  }
+
+  if (desiredRole === 'owner' && actorRole !== 'owner') {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can assign owner role' } });
+  }
 
   const { data, error } = await supabaseAdmin
     .from('profiles')

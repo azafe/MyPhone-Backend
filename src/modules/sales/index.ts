@@ -400,6 +400,27 @@ function mapRpcError(error: RpcLikeError): { status: number; code: string; messa
   return { status: 500, code: 'rpc_failed', message: 'Operation failed' };
 }
 
+function mapCheckoutRpcError(error: RpcLikeError): { status: number; code: string; message: string } {
+  const message = `${error.message ?? ''} ${error.details ?? ''} ${error.code ?? ''}`.toLowerCase();
+
+  if (message.includes('stock_unavailable') || message.includes('stock_conflict') || message.includes('imei_already_sold')) {
+    return { status: 409, code: 'stock_conflict', message: 'Stock item is no longer available for sale' };
+  }
+
+  if (
+    message.includes('validation_error')
+    || message.includes('total_mismatch')
+    || message.includes('invalid_payment_method')
+    || message.includes('invalid_card_brand')
+    || message.includes('invalid_currency')
+    || message.includes('not_found')
+  ) {
+    return { status: 422, code: 'validation_error', message: 'Invalid sale payload' };
+  }
+
+  return { status: 500, code: 'sale_create_failed', message: 'Failed to create sale' };
+}
+
 async function persistIdempotencyResult(idempotencyId: string | null, status: number, body: unknown): Promise<void> {
   if (!idempotencyId) return;
 
@@ -452,18 +473,18 @@ async function handleCheckoutSale(req: Request, res: Response) {
   const parsed = saleCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     logValidationError('sales.create', parsed.error.flatten(), { user_id: userId });
-    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', parsed.error.flatten()));
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', parsed.error.flatten()));
   }
 
   const normalized = normalizeCreatePayload(parsed.data);
   if (normalized.currency === 'USD' && Number(normalized.fx_rate_used ?? 0) <= 0) {
     logValidationError('sales.create', 'fx_rate_used_required_for_usd', { user_id: userId });
-    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', 'fx_rate_used_required_for_usd'));
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'fx_rate_used_required_for_usd'));
   }
 
   if (normalized.total_ars <= 0) {
     logValidationError('sales.create', 'total_ars_must_be_gt_0', { user_id: userId });
-    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', 'total_ars_must_be_gt_0'));
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'total_ars_must_be_gt_0'));
   }
 
   if (normalized.input_total_ars != null && Math.abs(normalized.input_total_ars - normalized.total_ars) > 0.01) {
@@ -472,7 +493,8 @@ async function handleCheckoutSale(req: Request, res: Response) {
       input_total_ars: normalized.input_total_ars,
       server_total_ars: normalized.total_ars
     });
-    return res.status(400).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
+    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', {
+      code: 'total_mismatch',
       input_total_ars: normalized.input_total_ars,
       server_total_ars: normalized.total_ars
     }));
@@ -571,7 +593,7 @@ async function handleCheckoutSale(req: Request, res: Response) {
   });
 
   if (rpcError) {
-    const mapped = mapRpcError(rpcError);
+    const mapped = mapCheckoutRpcError(rpcError);
     const body = makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message);
     logSaleCreateEvent({
       result: 'failed',
@@ -586,6 +608,30 @@ async function handleCheckoutSale(req: Request, res: Response) {
   }
 
   const responseBody = {
+    sale: {
+      id: rpcData?.sale_id ?? null,
+      trade_in_id: rpcData?.trade_in_id ?? null,
+      customer_id: rpcData?.customer_id ?? null,
+      seller_id: rpcData?.seller_id ?? normalized.seller_id ?? null,
+      total_ars: Number(rpcData?.total_ars ?? normalized.total_ars),
+      server_total_ars: Number(rpcData?.server_total_ars ?? normalized.total_ars),
+      paid_ars: Number(rpcData?.paid_ars ?? 0),
+      receivable_status: rpcData?.receivable_status ?? 'pending',
+      currency: rpcData?.currency ?? normalized.currency,
+      fx_rate_used: rpcData?.fx_rate_used ?? normalized.fx_rate_used,
+      total_usd: rpcData?.total_usd ?? normalized.total_usd,
+      balance_due_ars: rpcData?.balance_due_ars ?? normalized.balance_due_ars,
+      details: rpcData?.details ?? normalized.details,
+      notes: rpcData?.notes ?? normalized.notes,
+      includes_cube_20w: rpcData?.includes_cube_20w ?? normalized.includes_cube_20w
+    },
+    items_applied: normalized.items.map((item) => ({
+      stock_item_id: item.stock_item_id,
+      qty: item.qty,
+      sale_price_ars: item.sale_price_ars,
+      subtotal_ars: roundTo2(item.qty * item.sale_price_ars)
+    })),
+    stock_synced: true,
     sale_id: rpcData?.sale_id,
     trade_in_id: rpcData?.trade_in_id ?? null,
     customer_id: rpcData?.customer_id,
