@@ -11,6 +11,7 @@ import { tradeInsRouter } from './modules/tradeins/index.js';
 import { installmentRulesRouter } from './modules/rules/index.js';
 import { financeRouter } from './modules/finance/index.js';
 import { adminUsersRouter } from './modules/adminUsers/index.js';
+import { adminSeedUsersRouter } from './modules/adminSeedUsers/index.js';
 import { stockItemsRouter } from './modules/stockItems/index.js';
 import { planCanjeValuesRouter } from './modules/planCanjeValues/index.js';
 
@@ -118,6 +119,7 @@ app.use('/api/trade-ins', tradeInsRouter);
 app.use('/api/installment-rules', installmentRulesRouter);
 app.use('/api/finance', financeRouter);
 app.use('/api/admin/users', adminUsersRateLimit, adminUsersRouter);
+app.use('/api/admin/seed-users', adminUsersRateLimit, adminSeedUsersRouter);
 app.use('/api/stock-items', stockItemsRouter);
 app.use('/api/plan-canje-values', planCanjeValuesRouter);
 

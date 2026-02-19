@@ -24,6 +24,16 @@ const paymentLegacySchema = z.object({
   total_ars: z.coerce.number().positive().optional()
 });
 
+const paymentEntrySchema = z.object({
+  method: paymentMethodSchema,
+  currency: currencySchema.default('ARS'),
+  amount: z.coerce.number().positive(),
+  card_brand: z.string().trim().max(80).nullable().optional(),
+  installments: z.coerce.number().int().positive().nullable().optional(),
+  surcharge_pct: z.coerce.number().min(0).nullable().optional(),
+  note: z.string().trim().max(500).nullable().optional()
+});
+
 const saleItemSchema = z.object({
   stock_item_id: z.string().uuid(),
   qty: z.coerce.number().int().min(1).default(1),
@@ -45,9 +55,12 @@ const tradeInSchema = z.object({
 });
 
 const saleCreateSchema = z.object({
+  idempotency_key: z.string().trim().min(1).max(255).optional(),
+  idempotencyKey: z.string().trim().min(1).max(255).optional(),
   sale_date: z.string().datetime(),
   customer: customerSchema.optional(),
   customer_id: z.string().uuid().optional(),
+  seller_id: z.string().uuid().optional(),
   payment_method: paymentMethodSchema.optional(),
   card_brand: z.string().nullable().optional(),
   installments: z.coerce.number().int().positive().nullable().optional(),
@@ -58,8 +71,10 @@ const saleCreateSchema = z.object({
   fx_rate_used: z.coerce.number().positive().nullable().optional(),
   total_usd: z.coerce.number().positive().nullable().optional(),
   balance_due_ars: z.coerce.number().min(0).nullable().optional(),
+  details: z.string().trim().max(2000).nullable().optional(),
   notes: z.string().trim().max(2000).nullable().optional(),
   includes_cube_20w: z.boolean().optional(),
+  payments: z.array(paymentEntrySchema).min(1).optional(),
   items: z.array(saleItemSchema).min(1),
   payment: paymentLegacySchema.optional(),
   trade_in: tradeInSchema.optional()
@@ -164,15 +179,19 @@ type NormalizedCreatePayload = {
   installments: number | null;
   surcharge_pct: number | null;
   deposit_ars: number | null;
+  seller_id: string | null;
   total_ars: number;
   input_total_ars: number | null;
   currency: z.infer<typeof currencySchema>;
   fx_rate_used: number | null;
   total_usd: number | null;
   balance_due_ars: number;
+  details: string | null;
   notes: string | null;
   includes_cube_20w: boolean;
+  payments?: z.infer<typeof paymentEntrySchema>[];
   items: SaleItemInput[];
+  idempotency_key: string | null;
   payment?: z.infer<typeof paymentLegacySchema>;
   trade_in?: z.infer<typeof tradeInSchema>;
 };
@@ -265,11 +284,21 @@ function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): Normal
     : null;
   const totalUsd = input.total_usd ?? derivedTotalUsd;
   const balanceDueArs = input.balance_due_ars ?? Math.max(serverTotal - (depositArs ?? 0), 0);
+  const payments = input.payments?.map((entry) => ({
+    ...entry,
+    currency: entry.currency ?? 'ARS',
+    card_brand: entry.card_brand ?? null,
+    installments: entry.installments ?? null,
+    surcharge_pct: entry.surcharge_pct ?? null,
+    note: entry.note ?? null
+  }));
 
   return {
+    idempotency_key: input.idempotency_key ?? input.idempotencyKey ?? null,
     sale_date: input.sale_date,
     customer: input.customer,
     customer_id: input.customer_id,
+    seller_id: input.seller_id ?? null,
     payment_method: paymentMethod,
     card_brand: cardBrand,
     installments,
@@ -281,8 +310,10 @@ function normalizeCreatePayload(input: z.infer<typeof saleCreateSchema>): Normal
     fx_rate_used: fxRateUsed,
     total_usd: totalUsd,
     balance_due_ars: balanceDueArs,
+    details: input.details ?? null,
     notes: input.notes ?? null,
     includes_cube_20w: input.includes_cube_20w ?? false,
+    ...(payments ? { payments } : {}),
     items,
     payment: input.payment,
     trade_in: input.trade_in
@@ -327,10 +358,10 @@ function normalizePatchPayload(input: z.infer<typeof salePatchSchema>): Normaliz
 }
 
 function mapRpcError(error: RpcLikeError): { status: number; code: string; message: string } {
-  const message = (error.message ?? 'rpc_failed').toLowerCase();
+  const message = `${error.message ?? ''} ${error.details ?? ''} ${error.code ?? ''}`.toLowerCase();
 
   if (message.includes('total_mismatch')) {
-    return { status: 422, code: 'total_mismatch', message: 'Provided total_ars does not match server total' };
+    return { status: 400, code: 'total_mismatch', message: 'Provided total_ars does not match server total' };
   }
   if (message.includes('not_found')) {
     return { status: 404, code: 'not_found', message: 'Resource not found' };
@@ -339,13 +370,13 @@ function mapRpcError(error: RpcLikeError): { status: number; code: string; messa
     return { status: 409, code: 'conflict', message: 'Resource conflict' };
   }
   if (message.includes('validation_error')) {
-    return { status: 422, code: 'validation_error', message: 'Validation failed' };
+    return { status: 400, code: 'validation_error', message: 'Validation failed' };
   }
   if (message.includes('invalid_payment_method') || message.includes('invalid_card_brand') || message.includes('invalid_currency')) {
-    return { status: 422, code: 'validation_error', message: 'Validation failed' };
+    return { status: 400, code: 'validation_error', message: 'Validation failed' };
   }
 
-  return { status: 400, code: 'rpc_failed', message: 'Operation failed' };
+  return { status: 500, code: 'rpc_failed', message: 'Operation failed' };
 }
 
 async function persistIdempotencyResult(idempotencyId: string | null, status: number, body: unknown): Promise<void> {
@@ -364,10 +395,37 @@ function makeError(code: string, message: string, details?: unknown) {
   return { error: { code, message, details } };
 }
 
+function resolveIdempotencyKey(req: { header: (name: string) => string | undefined }, bodyKey?: string | null): string | null {
+  const fromHeader = req.header('idempotency-key')?.trim() || req.header('x-idempotency-key')?.trim();
+  const candidate = fromHeader || bodyKey?.trim() || '';
+  if (!candidate) {
+    return null;
+  }
+  return candidate.slice(0, 255);
+}
+
+function logSaleCreateEvent(payload: {
+  result: 'created' | 'idempotent_replay' | 'failed';
+  user_id: string;
+  sale_id?: string | null;
+  items_count: number;
+  status: number;
+  code?: string;
+  details?: unknown;
+}): void {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    level: payload.result === 'failed' ? 'error' : 'info',
+    event: 'sales_create',
+    ...payload,
+    timestamp: new Date().toISOString()
+  }));
+}
+
 router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('sales')
-    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei))')
+    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei)), sale_payments(id, method, currency, amount, card_brand, installments, surcharge_pct, note)')
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -420,7 +478,7 @@ router.get('/:id', requireRole('admin', 'seller'), async (req, res) => {
 
   const { data: sale, error: saleError } = await supabaseAdmin
     .from('sales')
-    .select('*, customers(name, phone), sale_items(*, stock_items(*)), trade_ins(*)')
+    .select('*, customers(name, phone), sale_items(*, stock_items(*)), sale_payments(*), trade_ins(*)')
     .eq('id', saleId)
     .single();
 
@@ -457,12 +515,12 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   const normalized = normalizeCreatePayload(parsed.data);
   if (normalized.currency === 'USD' && Number(normalized.fx_rate_used ?? 0) <= 0) {
     logValidationError('sales.create', 'fx_rate_used_required_for_usd', { user_id: userId });
-    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'fx_rate_used_required_for_usd'));
+    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', 'fx_rate_used_required_for_usd'));
   }
 
   if (normalized.total_ars <= 0) {
     logValidationError('sales.create', 'total_ars_must_be_gt_0', { user_id: userId });
-    return res.status(422).json(makeError('validation_error', 'Invalid sale payload', 'total_ars_must_be_gt_0'));
+    return res.status(400).json(makeError('validation_error', 'Invalid sale payload', 'total_ars_must_be_gt_0'));
   }
 
   if (normalized.input_total_ars != null && Math.abs(normalized.input_total_ars - normalized.total_ars) > 0.01) {
@@ -471,14 +529,15 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
       input_total_ars: normalized.input_total_ars,
       server_total_ars: normalized.total_ars
     });
-    return res.status(422).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
+    return res.status(400).json(makeError('total_mismatch', 'Provided total_ars does not match server total', {
       input_total_ars: normalized.input_total_ars,
       server_total_ars: normalized.total_ars
     }));
   }
 
-  const idempotencyKey = req.header('x-idempotency-key')?.trim();
-  const requestHash = hashPayload(normalized);
+  const { idempotency_key: bodyIdempotencyKey, ...basePayload } = normalized;
+  const idempotencyKey = resolveIdempotencyKey(req, bodyIdempotencyKey);
+  const requestHash = hashPayload(basePayload);
   let idempotencyId: string | null = null;
 
   if (idempotencyKey) {
@@ -501,6 +560,15 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
       }
 
       if (existing.response_status && existing.response_body) {
+        logSaleCreateEvent({
+          result: 'idempotent_replay',
+          user_id: userId,
+          sale_id: typeof (existing.response_body as Record<string, unknown>)?.sale_id === 'string'
+            ? (existing.response_body as Record<string, unknown>).sale_id as string
+            : null,
+          items_count: normalized.items.length,
+          status: existing.response_status
+        });
         return res.status(existing.response_status).json(existing.response_body);
       }
 
@@ -531,6 +599,15 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
             return res.status(409).json(makeError('idempotency_conflict', 'Same idempotency key used with different payload'));
           }
           if (raced.response_status && raced.response_body) {
+            logSaleCreateEvent({
+              result: 'idempotent_replay',
+              user_id: userId,
+              sale_id: typeof (raced.response_body as Record<string, unknown>)?.sale_id === 'string'
+                ? (raced.response_body as Record<string, unknown>).sale_id as string
+                : null,
+              items_count: normalized.items.length,
+              status: raced.response_status
+            });
             return res.status(raced.response_status).json(raced.response_body);
           }
           return res.status(409).json(makeError('idempotency_in_progress', 'Request with this idempotency key is in progress'));
@@ -543,10 +620,7 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     idempotencyId = inserted?.id ?? null;
   }
 
-  const rpcPayload = {
-    ...normalized,
-    total_ars: normalized.total_ars
-  };
+  const rpcPayload = basePayload;
 
   const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_create_sale_v2', {
     p_payload: rpcPayload,
@@ -556,6 +630,14 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   if (rpcError) {
     const mapped = mapRpcError(rpcError);
     const body = makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message);
+    logSaleCreateEvent({
+      result: 'failed',
+      user_id: userId,
+      items_count: normalized.items.length,
+      status: mapped.status,
+      code: mapped.code,
+      details: rpcError.details ?? rpcError.message
+    });
     await persistIdempotencyResult(idempotencyId, mapped.status, body);
     return res.status(mapped.status).json(body);
   }
@@ -570,10 +652,19 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     fx_rate_used: rpcData?.fx_rate_used ?? normalized.fx_rate_used,
     total_usd: rpcData?.total_usd ?? normalized.total_usd,
     balance_due_ars: rpcData?.balance_due_ars ?? normalized.balance_due_ars,
+    seller_id: rpcData?.seller_id ?? normalized.seller_id,
+    details: rpcData?.details ?? normalized.details,
     notes: rpcData?.notes ?? normalized.notes,
     includes_cube_20w: rpcData?.includes_cube_20w ?? normalized.includes_cube_20w
   };
 
+  logSaleCreateEvent({
+    result: 'created',
+    user_id: userId,
+    sale_id: typeof responseBody.sale_id === 'string' ? responseBody.sale_id : null,
+    items_count: normalized.items.length,
+    status: 201
+  });
   await persistIdempotencyResult(idempotencyId, 201, responseBody);
   return res.status(201).json(responseBody);
 });
