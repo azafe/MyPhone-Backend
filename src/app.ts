@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { authMiddleware } from './middleware/auth.js';
+import { authRouter } from './modules/auth/index.js';
 import { salesRouter } from './modules/sales/index.js';
 import { tradeInsRouter } from './modules/tradeins/index.js';
 import { installmentRulesRouter } from './modules/rules/index.js';
@@ -27,9 +28,19 @@ function parsePositiveInt(rawValue: string | undefined, fallback: number): numbe
 
 const allowedOrigins = new Set<string>([
   'https://myphonetuc.netlify.app',
+  'https://www.myphonetuc.netlify.app',
   'http://localhost:5173',
-  'http://127.0.0.1:5173'
+  'http://127.0.0.1:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:4173'
 ]);
+
+for (const origin of (process.env.CORS_ORIGINS ?? '').split(',')) {
+  const trimmed = origin.trim();
+  if (trimmed) {
+    allowedOrigins.add(trimmed);
+  }
+}
 
 function isAllowedOrigin(origin: string): boolean {
   if (allowedOrigins.has(origin)) {
@@ -47,7 +58,7 @@ const corsOptions: cors.CorsOptions = {
     return callback(new Error('Origin not allowed'));
   },
   credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Idempotency-Key', 'x-seed-secret'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   optionsSuccessStatus: 204
 };
@@ -112,6 +123,7 @@ app.get('/health', (_req, res) => res.json({
   env: runtimeEnv
 }));
 
+app.use('/api/auth', authRouter);
 app.use('/api', authMiddleware);
 
 app.use('/api/sales', salesRouter);

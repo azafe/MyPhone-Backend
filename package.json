@@ -8,7 +8,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "seed:users": "tsx scripts/seed-initial-users.ts"
+    "seed:users": "tsx scripts/seed-initial-users.ts",
+    "test:lote7:smoke": "node scripts/test-lote7-smoke.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

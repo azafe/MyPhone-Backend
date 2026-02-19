@@ -1,18 +1,20 @@
 import { createHash } from 'node:crypto';
 import { Router } from 'express';
+import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../../lib/supabaseAdmin.js';
 import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
-const IDEMPOTENCY_ROUTE = 'POST /api/sales';
+const IDEMPOTENCY_ROUTE = 'sales_checkout_v1';
 
 const paymentMethodSchema = z.enum(['cash', 'transfer', 'card', 'mixed', 'trade_in']);
 const currencySchema = z.enum(['ARS', 'USD']);
 
 const customerSchema = z.object({
   name: z.string().min(1),
-  phone: z.string().min(6)
+  phone: z.string().min(6),
+  dni: z.string().trim().min(6).max(32).optional()
 });
 
 const paymentLegacySchema = z.object({
@@ -162,6 +164,22 @@ const salePatchSchema = z.object({
 
 const cancelSchema = z.object({
   reason: z.string().trim().min(3).max(500)
+});
+
+const registerPaymentSchema = z.object({
+  method: paymentMethodSchema,
+  currency: currencySchema.default('ARS'),
+  amount: z.coerce.number().positive(),
+  card_brand: z.string().trim().max(80).nullable().optional(),
+  installments: z.coerce.number().int().positive().nullable().optional(),
+  surcharge_pct: z.coerce.number().min(0).nullable().optional(),
+  note: z.string().trim().max(500).nullable().optional()
+});
+
+const settleSchema = z.object({
+  method: paymentMethodSchema.optional(),
+  currency: currencySchema.optional(),
+  note: z.string().trim().max(500).nullable().optional()
 });
 
 type SaleItemInput = {
@@ -366,7 +384,10 @@ function mapRpcError(error: RpcLikeError): { status: number; code: string; messa
   if (message.includes('not_found')) {
     return { status: 404, code: 'not_found', message: 'Resource not found' };
   }
-  if (message.includes('stock_unavailable') || message.includes('conflict')) {
+  if (message.includes('stock_unavailable') || message.includes('stock_conflict') || message.includes('imei_already_sold')) {
+    return { status: 409, code: 'stock_conflict', message: 'One or more stock items are no longer available' };
+  }
+  if (message.includes('conflict')) {
     return { status: 409, code: 'conflict', message: 'Resource conflict' };
   }
   if (message.includes('validation_error')) {
@@ -422,85 +443,7 @@ function logSaleCreateEvent(payload: {
   }));
 }
 
-router.get('/', requireRole('admin', 'seller'), async (_req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('sales')
-    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei)), sale_payments(id, method, currency, amount, card_brand, installments, surcharge_pct, note)')
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    return res.status(400).json(makeError('sales_fetch_failed', 'Sales fetch failed', error.message));
-  }
-
-  const rows = (data ?? []).flatMap((sale) => {
-    const items = sale.sale_items ?? [];
-    const customerName = sale.customers?.name ?? null;
-    const customerPhone = sale.customers?.phone ?? null;
-
-    if (items.length === 0) {
-      return [{
-        ...sale,
-        stock_item_id: null,
-        stock_model: null,
-        stock_imei: null,
-        qty: null,
-        sale_price_ars_item: null,
-        subtotal_ars_item: null,
-        customer_name: customerName,
-        customer_phone: customerPhone
-      }];
-    }
-
-    return items.map((item: {
-      stock_item_id: string;
-      qty: number | null;
-      sale_price_ars: number | null;
-      subtotal_ars: number | null;
-      stock_items?: { model: string | null; imei: string | null };
-    }) => ({
-      ...sale,
-      stock_item_id: item.stock_item_id,
-      stock_model: item.stock_items?.model ?? null,
-      stock_imei: item.stock_items?.imei ?? null,
-      qty: item.qty,
-      sale_price_ars_item: item.sale_price_ars,
-      subtotal_ars_item: item.subtotal_ars,
-      customer_name: customerName,
-      customer_phone: customerPhone
-    }));
-  });
-
-  return res.json({ sales: rows });
-});
-
-router.get('/:id', requireRole('admin', 'seller'), async (req, res) => {
-  const saleId = req.params.id;
-
-  const { data: sale, error: saleError } = await supabaseAdmin
-    .from('sales')
-    .select('*, customers(name, phone), sale_items(*, stock_items(*)), sale_payments(*), trade_ins(*)')
-    .eq('id', saleId)
-    .single();
-
-  if (saleError || !sale) {
-    return res.status(404).json(makeError('not_found', 'Sale not found', saleError?.message));
-  }
-
-  const { data: auditLogs } = await supabaseAdmin
-    .from('sale_audit_logs')
-    .select('id, action, actor_user_id, reason, payload, created_at')
-    .eq('sale_id', saleId)
-    .order('created_at', { ascending: false });
-
-  return res.json({
-    sale: {
-      ...sale,
-      audit_logs: auditLogs ?? []
-    }
-  });
-});
-
-router.post('/', requireRole('admin', 'seller'), async (req, res) => {
+async function handleCheckoutSale(req: Request, res: Response) {
   const userId = req.user?.id;
   if (!userId) {
     return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
@@ -648,6 +591,8 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
     customer_id: rpcData?.customer_id,
     total_ars: Number(rpcData?.total_ars ?? normalized.total_ars),
     server_total_ars: Number(rpcData?.server_total_ars ?? normalized.total_ars),
+    paid_ars: Number(rpcData?.paid_ars ?? 0),
+    receivable_status: rpcData?.receivable_status ?? 'pending',
     currency: rpcData?.currency ?? normalized.currency,
     fx_rate_used: rpcData?.fx_rate_used ?? normalized.fx_rate_used,
     total_usd: rpcData?.total_usd ?? normalized.total_usd,
@@ -667,9 +612,152 @@ router.post('/', requireRole('admin', 'seller'), async (req, res) => {
   });
   await persistIdempotencyResult(idempotencyId, 201, responseBody);
   return res.status(201).json(responseBody);
+}
+
+router.get('/', requireRole('seller'), async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('sales')
+    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei)), sale_payments(id, method, currency, amount, card_brand, installments, surcharge_pct, note)')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    return res.status(400).json(makeError('sales_fetch_failed', 'Sales fetch failed', error.message));
+  }
+
+  const rows = (data ?? []).flatMap((sale) => {
+    const items = sale.sale_items ?? [];
+    const customerName = sale.customers?.name ?? null;
+    const customerPhone = sale.customers?.phone ?? null;
+
+    if (items.length === 0) {
+      return [{
+        ...sale,
+        stock_item_id: null,
+        stock_model: null,
+        stock_imei: null,
+        qty: null,
+        sale_price_ars_item: null,
+        subtotal_ars_item: null,
+        customer_name: customerName,
+        customer_phone: customerPhone
+      }];
+    }
+
+    return items.map((item: {
+      stock_item_id: string;
+      qty: number | null;
+      sale_price_ars: number | null;
+      subtotal_ars: number | null;
+      stock_items?: { model: string | null; imei: string | null };
+    }) => ({
+      ...sale,
+      stock_item_id: item.stock_item_id,
+      stock_model: item.stock_items?.model ?? null,
+      stock_imei: item.stock_items?.imei ?? null,
+      qty: item.qty,
+      sale_price_ars_item: item.sale_price_ars,
+      subtotal_ars_item: item.subtotal_ars,
+      customer_name: customerName,
+      customer_phone: customerPhone
+    }));
+  });
+
+  return res.json({ sales: rows });
 });
 
-router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
+router.get('/:id', requireRole('seller'), async (req, res) => {
+  const saleId = req.params.id;
+
+  const { data: sale, error: saleError } = await supabaseAdmin
+    .from('sales')
+    .select('*, customers(name, phone), sale_items(*, stock_items(*)), sale_payments(*), trade_ins(*)')
+    .eq('id', saleId)
+    .single();
+
+  if (saleError || !sale) {
+    return res.status(404).json(makeError('not_found', 'Sale not found', saleError?.message));
+  }
+
+  const { data: auditLogs } = await supabaseAdmin
+    .from('sale_audit_logs')
+    .select('id, action, actor_user_id, reason, payload, created_at')
+    .eq('sale_id', saleId)
+    .order('created_at', { ascending: false });
+
+  return res.json({
+    sale: {
+      ...sale,
+      audit_logs: auditLogs ?? []
+    }
+  });
+});
+
+router.post('/checkout', requireRole('seller'), handleCheckoutSale);
+router.post('/', requireRole('seller'), handleCheckoutSale);
+
+router.post('/:id/payments', requireRole('seller'), async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
+  }
+
+  const parsed = registerPaymentSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid payment payload', parsed.error.flatten()));
+  }
+
+  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_register_sale_payment_v1', {
+    p_sale_id: req.params.id,
+    p_payload: parsed.data,
+    p_user_id: userId
+  });
+
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
+  }
+
+  return res.status(201).json({
+    sale_id: rpcData?.sale_id,
+    payment_id: rpcData?.payment_id ?? null,
+    paid_ars: Number(rpcData?.paid_ars ?? 0),
+    balance_due_ars: Number(rpcData?.balance_due_ars ?? 0),
+    receivable_status: rpcData?.receivable_status ?? 'pending'
+  });
+});
+
+router.post('/:id/settle', requireRole('seller'), async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
+  }
+
+  const parsed = settleSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid settle payload', parsed.error.flatten()));
+  }
+
+  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_settle_sale_v1', {
+    p_sale_id: req.params.id,
+    p_payload: parsed.data,
+    p_user_id: userId
+  });
+
+  if (rpcError) {
+    const mapped = mapRpcError(rpcError);
+    return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
+  }
+
+  return res.json({
+    sale_id: rpcData?.sale_id,
+    payment_id: rpcData?.payment_id ?? null,
+    paid_ars: Number(rpcData?.paid_ars ?? 0),
+    balance_due_ars: Number(rpcData?.balance_due_ars ?? 0),
+    receivable_status: rpcData?.receivable_status ?? 'paid'
+  });
+});
+
+router.patch('/:id', requireRole('seller'), async (req, res) => {
   const userId = req.user?.id;
   if (!userId) {
     return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
@@ -729,7 +817,7 @@ router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
   });
 });
 
-router.post('/:id/cancel', requireRole('admin', 'seller'), async (req, res) => {
+router.post('/:id/cancel', requireRole('seller'), async (req, res) => {
   const userId = req.user?.id;
   if (!userId) {
     return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));

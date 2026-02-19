@@ -10,12 +10,19 @@ const querySchema = z.object({
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
 });
 
+const accountsReceivableQuerySchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  seller_id: z.string().uuid().optional(),
+  status: z.enum(['pending', 'partial', 'paid']).optional()
+});
+
 type PaymentMixRow = {
   method: string;
   total: number;
 };
 
-router.get('/summary', requireRole('admin', 'seller'), async (req, res) => {
+router.get('/summary', requireRole('admin'), async (req, res) => {
   const parsed = querySchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid date range', details: parsed.error.flatten() } });
@@ -102,6 +109,72 @@ router.get('/summary', requireRole('admin', 'seller'), async (req, res) => {
     sales_month_usd: 0,
     margin_month: margin_total
   });
+});
+
+router.get('/accounts-receivable', requireRole('admin'), async (req, res) => {
+  const parsed = accountsReceivableQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: {
+        code: 'validation_error',
+        message: 'Invalid accounts receivable query',
+        details: parsed.error.flatten()
+      }
+    });
+  }
+
+  const { from, to, seller_id, status } = parsed.data;
+
+  let salesQuery = supabaseAdmin
+    .from('sales')
+    .select('id, sale_date, seller_id, total_ars, paid_ars, balance_due_ars, receivable_status, customers(name, phone)')
+    .gte('sale_date', `${from}T00:00:00Z`)
+    .lte('sale_date', `${to}T23:59:59Z`)
+    .eq('status', 'completed')
+    .order('sale_date', { ascending: false });
+
+  if (seller_id) {
+    salesQuery = salesQuery.eq('seller_id', seller_id);
+  }
+
+  if (status) {
+    salesQuery = salesQuery.eq('receivable_status', status);
+  }
+
+  const { data: sales, error } = await salesQuery;
+  if (error) {
+    return res.status(400).json({
+      error: {
+        code: 'finance_fetch_failed',
+        message: 'Accounts receivable query failed',
+        details: error.message
+      }
+    });
+  }
+
+  const now = Date.now();
+  const receivables = (sales ?? []).map((sale) => {
+    const customer = Array.isArray(sale.customers) ? sale.customers[0] : sale.customers;
+    const saleDate = new Date(sale.sale_date);
+    const daysSinceSale = Number.isNaN(saleDate.getTime())
+      ? 0
+      : Math.max(0, Math.floor((now - saleDate.getTime()) / (24 * 60 * 60 * 1000)));
+
+    return {
+      sale_id: sale.id,
+      customer_name: customer?.name ?? null,
+      customer_phone: customer?.phone ?? null,
+      sale_date: sale.sale_date,
+      total_ars: Number(sale.total_ars ?? 0),
+      paid_ars: Number(sale.paid_ars ?? 0),
+      balance_due_ars: Number(sale.balance_due_ars ?? 0),
+      status: sale.receivable_status ?? 'pending',
+      days_since_sale: daysSinceSale,
+      seller_id: sale.seller_id ?? null
+    };
+  });
+
+  return res.json({ receivables });
 });
 
 export const financeRouter = router;
