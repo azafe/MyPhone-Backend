@@ -11,7 +11,8 @@
     "seed:users": "tsx scripts/seed-initial-users.ts",
     "test:lote7:smoke": "node scripts/test-lote7-smoke.mjs",
     "test:mvp:atomic": "node scripts/test-mvp-atomic-role.mjs",
-    "test:finance:summary": "node scripts/test-finance-summary.mjs"
+    "test:finance:summary": "node scripts/test-finance-summary.mjs",
+    "test:sales:list": "node scripts/test-sales-list-embed-regression.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

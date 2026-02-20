@@ -7,6 +7,14 @@ import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
 const IDEMPOTENCY_ROUTE = 'sales_checkout_v1';
+const SALES_TO_SALE_ITEMS_FK_CANDIDATES = [
+  'sale_items_sale_id_fk',
+  'sale_items_sale_id_fkey'
+] as const;
+const SALE_ITEMS_TO_STOCK_ITEMS_FK_CANDIDATES = [
+  'sale_items_stock_item_id_fk',
+  'sale_items_stock_item_id_fkey'
+] as const;
 
 const paymentMethodSchema = z.enum(['cash', 'transfer', 'card', 'mixed', 'trade_in']);
 const currencySchema = z.enum(['ARS', 'USD']);
@@ -238,6 +246,7 @@ type RpcLikeError = {
   message?: string;
   details?: string;
   code?: string;
+  hint?: string;
 };
 
 function stableStringify(value: unknown): string {
@@ -419,6 +428,59 @@ function mapCheckoutRpcError(error: RpcLikeError): { status: number; code: strin
   }
 
   return { status: 500, code: 'sale_create_failed', message: 'Failed to create sale' };
+}
+
+function isEmbedRelationError(error: RpcLikeError | null | undefined): boolean {
+  return error?.code === 'PGRST200' || error?.code === 'PGRST201';
+}
+
+async function fetchSalesListRows() {
+  let lastError: RpcLikeError | null = null;
+
+  for (const saleItemsFkName of SALES_TO_SALE_ITEMS_FK_CANDIDATES) {
+    for (const stockItemsFkName of SALE_ITEMS_TO_STOCK_ITEMS_FK_CANDIDATES) {
+      const { data, error } = await supabaseAdmin
+        .from('sales')
+        .select(`*, customers(name, phone), sale_items!${saleItemsFkName}(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items!${stockItemsFkName}(model, imei)), sale_payments(id, method, currency, amount, card_brand, installments, surcharge_pct, note)`)
+        .order('created_at', { ascending: false });
+
+      if (!error) {
+        return { data: data ?? [], error: null as RpcLikeError | null };
+      }
+
+      lastError = error;
+      if (!isEmbedRelationError(error)) {
+        break;
+      }
+    }
+  }
+
+  return { data: null as unknown[] | null, error: lastError };
+}
+
+async function fetchSaleByIdWithRelations(saleId: string) {
+  let lastError: RpcLikeError | null = null;
+
+  for (const saleItemsFkName of SALES_TO_SALE_ITEMS_FK_CANDIDATES) {
+    for (const stockItemsFkName of SALE_ITEMS_TO_STOCK_ITEMS_FK_CANDIDATES) {
+      const { data, error } = await supabaseAdmin
+        .from('sales')
+        .select(`*, customers(name, phone), sale_items!${saleItemsFkName}(*, stock_items!${stockItemsFkName}(*)), sale_payments(*), trade_ins(*)`)
+        .eq('id', saleId)
+        .single();
+
+      if (!error) {
+        return { data, error: null as RpcLikeError | null };
+      }
+
+      lastError = error;
+      if (!isEmbedRelationError(error)) {
+        break;
+      }
+    }
+  }
+
+  return { data: null as Record<string, unknown> | null, error: lastError };
 }
 
 async function persistIdempotencyResult(idempotencyId: string | null, status: number, body: unknown): Promise<void> {
@@ -661,10 +723,7 @@ async function handleCheckoutSale(req: Request, res: Response) {
 }
 
 router.get('/', requireRole('seller'), async (_req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('sales')
-    .select('*, customers(name, phone), sale_items(stock_item_id, qty, sale_price_ars, subtotal_ars, stock_items(model, imei)), sale_payments(id, method, currency, amount, card_brand, installments, surcharge_pct, note)')
-    .order('created_at', { ascending: false });
+  const { data, error } = await fetchSalesListRows();
 
   if (error) {
     return res.status(400).json(makeError('sales_fetch_failed', 'Sales fetch failed', error.message));
@@ -694,18 +753,21 @@ router.get('/', requireRole('seller'), async (_req, res) => {
       qty: number | null;
       sale_price_ars: number | null;
       subtotal_ars: number | null;
-      stock_items?: { model: string | null; imei: string | null };
-    }) => ({
+      stock_items?: { model: string | null; imei: string | null } | Array<{ model: string | null; imei: string | null }>;
+    }) => {
+      const stockItem = Array.isArray(item.stock_items) ? item.stock_items[0] : item.stock_items;
+      return ({
       ...sale,
       stock_item_id: item.stock_item_id,
-      stock_model: item.stock_items?.model ?? null,
-      stock_imei: item.stock_items?.imei ?? null,
+      stock_model: stockItem?.model ?? null,
+      stock_imei: stockItem?.imei ?? null,
       qty: item.qty,
       sale_price_ars_item: item.sale_price_ars,
       subtotal_ars_item: item.subtotal_ars,
       customer_name: customerName,
       customer_phone: customerPhone
-    }));
+      });
+    });
   });
 
   return res.json({ sales: rows });
@@ -714,11 +776,7 @@ router.get('/', requireRole('seller'), async (_req, res) => {
 router.get('/:id', requireRole('seller'), async (req, res) => {
   const saleId = req.params.id;
 
-  const { data: sale, error: saleError } = await supabaseAdmin
-    .from('sales')
-    .select('*, customers(name, phone), sale_items(*, stock_items(*)), sale_payments(*), trade_ins(*)')
-    .eq('id', saleId)
-    .single();
+  const { data: sale, error: saleError } = await fetchSaleByIdWithRelations(saleId);
 
   if (saleError || !sale) {
     return res.status(404).json(makeError('not_found', 'Sale not found', saleError?.message));
