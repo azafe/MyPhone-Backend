@@ -1,9 +1,22 @@
 import { Router } from 'express';
+import { createClient } from '@supabase/supabase-js';
 import { z } from 'zod';
-import { supabaseAdmin } from '../../lib/supabaseAdmin.js';
 import { requireRole } from '../../middleware/rbac.js';
 
 const router = Router();
+const supabaseUrl = process.env.SUPABASE_URL ?? '';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+
+const supabaseService = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false
+  }
+});
 
 const ROLE_RANK = {
   seller: 1,
@@ -19,12 +32,117 @@ const createSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
   full_name: z.string().min(1),
-  role: z.enum(['seller', 'admin', 'owner'])
+  role: z.enum(['seller', 'admin'])
 });
 
 const patchSchema = z.object({
   full_name: z.string().min(1).optional(),
-  role: z.enum(['seller', 'admin', 'owner']).optional()
+  role: z.enum(['seller', 'admin']).optional()
+});
+
+type AuthUserLike = {
+  id: string;
+  email?: string | null;
+  banned_until?: string | null;
+};
+
+type ProfileLike = {
+  id: string;
+  full_name: string | null;
+  role: string | null;
+};
+
+function isEnabledAuthUser(user: AuthUserLike): boolean {
+  const bannedUntil = user.banned_until;
+  if (!bannedUntil) {
+    return true;
+  }
+
+  const bannedUntilTs = Date.parse(bannedUntil);
+  if (!Number.isFinite(bannedUntilTs)) {
+    return false;
+  }
+
+  return bannedUntilTs <= Date.now();
+}
+
+async function listAllAuthUsers(): Promise<AuthUserLike[]> {
+  const users: AuthUserLike[] = [];
+  const perPage = 200;
+
+  for (let page = 1; page <= 50; page += 1) {
+    const { data, error } = await supabaseService.auth.admin.listUsers({ page, perPage });
+    if (error) {
+      throw error;
+    }
+
+    const batch = (data?.users ?? []) as AuthUserLike[];
+    users.push(...batch);
+
+    if (batch.length < perPage) {
+      break;
+    }
+  }
+
+  return users;
+}
+
+router.get('/', requireRole('admin'), async (_req, res) => {
+  try {
+    const authUsers = await listAllAuthUsers();
+
+    if (authUsers.length === 0) {
+      return res.json({ users: [] });
+    }
+
+    const profileIds = authUsers.map((user) => user.id);
+    const { data: profiles, error: profilesError } = await supabaseService
+      .from('profiles')
+      .select('id, full_name, role')
+      .in('id', profileIds);
+
+    if (profilesError) {
+      return res.status(400).json({
+        error: {
+          code: 'users_fetch_failed',
+          message: 'Profiles query failed',
+          details: profilesError.message
+        }
+      });
+    }
+
+    const profileMap = new Map<string, ProfileLike>(
+      (profiles ?? []).map((profile) => [profile.id, profile as ProfileLike])
+    );
+
+    const users = authUsers
+      .map((user) => {
+        const profile = profileMap.get(user.id);
+        if (!profile || !isManagedRole(profile.role)) {
+          return null;
+        }
+
+        return {
+          id: user.id,
+          email: user.email ?? null,
+          full_name: profile.full_name ?? user.email ?? '',
+          role: profile.role,
+          is_enabled: isEnabledAuthUser(user)
+        };
+      })
+      .filter((value): value is { id: string; email: string | null; full_name: string; role: 'seller' | 'admin' | 'owner'; is_enabled: boolean } => Boolean(value))
+      .sort((a, b) => a.full_name.localeCompare(b.full_name));
+
+    return res.json({ users });
+  } catch (error) {
+    return res.status(400).json({
+      error: {
+        code: 'users_fetch_failed',
+        message: 'Users fetch failed',
+        details: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
 });
 
 router.post('/', requireRole('admin'), async (req, res) => {
@@ -38,30 +156,61 @@ router.post('/', requireRole('admin'), async (req, res) => {
   if (role === 'admin' && actorRole !== 'owner') {
     return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can promote users to admin' } });
   }
-  if (role === 'owner' && actorRole !== 'owner') {
-    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can assign owner role' } });
-  }
 
-  const { data: userData, error: userError } = await supabaseAdmin.auth.admin.createUser({
+  const { data: userData, error: userError } = await supabaseService.auth.admin.createUser({
     email,
     password,
-    email_confirm: true
+    email_confirm: true,
+    user_metadata: {
+      full_name,
+      role
+    }
   });
 
   if (userError || !userData?.user) {
     return res.status(400).json({ error: { code: 'user_create_failed', message: 'Auth create failed', details: userError?.message } });
   }
 
-  const { error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .insert({ id: userData.user.id, full_name, role });
+  let profileSynced = false;
+  let profileSyncError: string | null = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const { data: existingProfile, error: existingProfileError } = await supabaseService
+      .from('profiles')
+      .select('id')
+      .eq('id', userData.user.id)
+      .maybeSingle();
 
-  if (profileError) {
-    await supabaseAdmin.auth.admin.deleteUser(userData.user.id);
-    return res.status(400).json({ error: { code: 'profile_create_failed', message: 'Profile insert failed', details: profileError.message } });
+    if (existingProfileError) {
+      profileSyncError = existingProfileError.message;
+      break;
+    }
+
+    if (!existingProfile?.id) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
+
+    const { error: profileError } = await supabaseService
+      .from('profiles')
+      .update({ full_name, role })
+      .eq('id', userData.user.id)
+      .select('id');
+
+    if (profileError) {
+      profileSyncError = profileError.message;
+      break;
+    }
+
+    profileSynced = true;
+    break;
   }
 
-  await supabaseAdmin
+  if (!profileSynced) {
+    await supabaseService.auth.admin.deleteUser(userData.user.id);
+    return res.status(400).json({ error: { code: 'profile_create_failed', message: 'Profile sync failed', details: profileSyncError ?? 'profile_not_ready' } });
+  }
+
+  await supabaseService
     .from('audit_logs')
     .insert({
       actor_user_id: req.user?.id ?? null,
@@ -73,7 +222,16 @@ router.post('/', requireRole('admin'), async (req, res) => {
       meta_json: { source: 'admin_users_create' }
     });
 
-  return res.status(201).json({ user_id: userData.user.id });
+  return res.status(201).json({
+    user_id: userData.user.id,
+    user: {
+      id: userData.user.id,
+      email,
+      full_name,
+      role,
+      is_enabled: true
+    }
+  });
 });
 
 router.patch('/:id', requireRole('admin'), async (req, res) => {
@@ -82,7 +240,7 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: { code: 'validation_error', message: 'Invalid patch payload', details: parsed.error.flatten() } });
   }
 
-  const { data: beforeProfile } = await supabaseAdmin
+  const { data: beforeProfile } = await supabaseService
     .from('profiles')
     .select('role, full_name')
     .eq('id', req.params.id)
@@ -99,7 +257,7 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     return res.status(409).json({ error: { code: 'protected_role', message: 'Target profile role is protected' } });
   }
 
-  if (targetRole === 'owner' && desiredRole && desiredRole !== 'owner') {
+  if (targetRole === 'owner' && desiredRole) {
     return res.status(409).json({ error: { code: 'protected_role', message: 'Owner role cannot be changed via this endpoint' } });
   }
 
@@ -111,11 +269,7 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can promote users to admin' } });
   }
 
-  if (desiredRole === 'owner' && actorRole !== 'owner') {
-    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Only owner can assign owner role' } });
-  }
-
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await supabaseService
     .from('profiles')
     .update(parsed.data)
     .eq('id', req.params.id)
@@ -126,7 +280,7 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: { code: 'profile_update_failed', message: 'Profile update failed', details: error?.message } });
   }
 
-  await supabaseAdmin
+  await supabaseService
     .from('audit_logs')
     .insert({
       actor_user_id: req.user?.id ?? null,

@@ -1,7 +1,22 @@
 import type { Request, Response, NextFunction } from 'express';
-import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { createClient } from '@supabase/supabase-js';
 
 const PUBLIC_PATH_PREFIXES = ['/auth/login'];
+const supabaseUrl = process.env.SUPABASE_URL ?? '';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+
+function createServiceClient() {
+  return createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
+  });
+}
 
 function isPublicPath(path: string): boolean {
   return PUBLIC_PATH_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
@@ -20,18 +35,20 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
       return next();
     }
 
+    const supabaseService = createServiceClient();
+
     const header = req.header('authorization') || '';
     const [scheme, token] = header.split(' ');
     if (scheme !== 'Bearer' || !token) {
       return res.status(401).json({ error: { code: 'unauthorized', message: 'Missing Bearer token' } });
     }
 
-    const { data: userData, error: userError } = await supabaseAdmin.auth.getUser(token);
+    const { data: userData, error: userError } = await supabaseService.auth.getUser(token);
     if (userError || !userData?.user) {
       return res.status(401).json({ error: { code: 'unauthorized', message: 'Invalid token', details: userError?.message } });
     }
 
-    const { data: profile, error: profileError } = await supabaseAdmin
+    const { data: profile, error: profileError } = await supabaseService
       .from('profiles')
       .select('role, full_name')
       .eq('id', userData.user.id)
