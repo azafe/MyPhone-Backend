@@ -69,11 +69,15 @@ const report = {
   seller_blocked: null,
   owner_protected: null,
   role_change_valid: null,
-  self_demotion_blocked: null
+  self_demotion_blocked: null,
+  admin_delete_owner_blocked: null,
+  admin_delete_seller_valid: null,
+  owner_delete_admin_valid: null
 };
 
 let tempAdminId = null;
-let tempSellerId = null;
+let tempSellerPromoteId = null;
+let tempSellerDeleteId = null;
 
 try {
   const ownerAuth = await login('mocho@gmail.com', '123456');
@@ -87,7 +91,8 @@ try {
 
   const timestamp = Date.now();
   const tempAdminEmail = `tmp-admin-${timestamp}@example.com`;
-  const tempSellerEmail = `tmp-seller-${timestamp}@example.com`;
+  const tempSellerPromoteEmail = `tmp-seller-promote-${timestamp}@example.com`;
+  const tempSellerDeleteEmail = `tmp-seller-delete-${timestamp}@example.com`;
   const tempPassword = 'TempPass123!';
 
   const createAdmin = await fetchJson('/api/admin/users', {
@@ -104,19 +109,33 @@ try {
   tempAdminId = createAdmin.body?.user_id ?? createAdmin.body?.user?.id ?? null;
   assert(Boolean(tempAdminId), 'missing_temp_admin_id', createAdmin);
 
-  const createSeller = await fetchJson('/api/admin/users', {
+  const createSellerPromote = await fetchJson('/api/admin/users', {
     method: 'POST',
     token: ownerToken,
     body: {
-      email: tempSellerEmail,
+      email: tempSellerPromoteEmail,
       password: tempPassword,
-      full_name: 'Temp Seller',
+      full_name: 'Temp Seller Promote',
       role: 'seller'
     }
   });
-  assert(createSeller.status === 201, 'create_temp_seller_should_be_201', createSeller);
-  tempSellerId = createSeller.body?.user_id ?? createSeller.body?.user?.id ?? null;
-  assert(Boolean(tempSellerId), 'missing_temp_seller_id', createSeller);
+  assert(createSellerPromote.status === 201, 'create_temp_seller_promote_should_be_201', createSellerPromote);
+  tempSellerPromoteId = createSellerPromote.body?.user_id ?? createSellerPromote.body?.user?.id ?? null;
+  assert(Boolean(tempSellerPromoteId), 'missing_temp_seller_promote_id', createSellerPromote);
+
+  const createSellerDelete = await fetchJson('/api/admin/users', {
+    method: 'POST',
+    token: ownerToken,
+    body: {
+      email: tempSellerDeleteEmail,
+      password: tempPassword,
+      full_name: 'Temp Seller Delete',
+      role: 'seller'
+    }
+  });
+  assert(createSellerDelete.status === 201, 'create_temp_seller_delete_should_be_201', createSellerDelete);
+  tempSellerDeleteId = createSellerDelete.body?.user_id ?? createSellerDelete.body?.user?.id ?? null;
+  assert(Boolean(tempSellerDeleteId), 'missing_temp_seller_delete_id', createSellerDelete);
 
   const adminAuth = await login(tempAdminEmail, tempPassword);
   const adminList = await fetchJson('/api/admin/users', { token: adminAuth.token });
@@ -138,7 +157,7 @@ try {
   assert(ownerProtected.body?.error?.code === 'protected_role', 'owner_role_change_code_should_be_protected_role', ownerProtected);
   report.owner_protected = { status: ownerProtected.status, code: ownerProtected.body?.error?.code ?? null };
 
-  const validRoleChange = await fetchJson(`/api/admin/users/${tempSellerId}`, {
+  const validRoleChange = await fetchJson(`/api/admin/users/${tempSellerPromoteId}`, {
     method: 'PATCH',
     token: ownerToken,
     body: { role: 'admin' }
@@ -147,8 +166,8 @@ try {
 
   const verifyList = await fetchJson('/api/admin/users', { token: ownerToken });
   assert(verifyList.status === 200, 'verify_users_list_should_be_200', verifyList);
-  const updatedSeller = (verifyList.body?.users ?? []).find((user) => user.id === tempSellerId);
-  assert(updatedSeller?.role === 'admin', 'temp_seller_should_be_promoted_to_admin', { updatedSeller, verifyList: verifyList.body });
+  const updatedSeller = (verifyList.body?.users ?? []).find((user) => user.id === tempSellerPromoteId);
+  assert(updatedSeller?.role === 'admin', 'temp_seller_promote_should_be_promoted_to_admin', { updatedSeller, verifyList: verifyList.body });
   report.role_change_valid = { status: validRoleChange.status, new_role: updatedSeller?.role ?? null };
 
   const selfDemotion = await fetchJson(`/api/admin/users/${tempAdminId}`, {
@@ -160,13 +179,39 @@ try {
   assert(selfDemotion.body?.error?.code === 'forbidden_role_change', 'self_demotion_code_should_be_forbidden_role_change', selfDemotion);
   report.self_demotion_blocked = { status: selfDemotion.status, code: selfDemotion.body?.error?.code ?? null };
 
+  const adminDeleteOwner = await fetchJson('/api/admin/users/e0f726d7-a32f-48e4-9b2c-06ac899660dc', {
+    method: 'DELETE',
+    token: adminAuth.token
+  });
+  assert(adminDeleteOwner.status === 403, 'admin_delete_owner_should_be_403', adminDeleteOwner);
+  report.admin_delete_owner_blocked = { status: adminDeleteOwner.status, code: adminDeleteOwner.body?.error?.code ?? null };
+
+  const adminDeleteSeller = await fetchJson(`/api/admin/users/${tempSellerDeleteId}`, {
+    method: 'DELETE',
+    token: adminAuth.token
+  });
+  assert(adminDeleteSeller.status === 204, 'admin_delete_seller_should_be_204', adminDeleteSeller);
+  report.admin_delete_seller_valid = { status: adminDeleteSeller.status };
+  tempSellerDeleteId = null;
+
+  const ownerDeleteAdmin = await fetchJson(`/api/admin/users/${tempSellerPromoteId}`, {
+    method: 'DELETE',
+    token: ownerToken
+  });
+  assert(ownerDeleteAdmin.status === 204, 'owner_delete_admin_should_be_204', ownerDeleteAdmin);
+  report.owner_delete_admin_valid = { status: ownerDeleteAdmin.status };
+  tempSellerPromoteId = null;
+
   // eslint-disable-next-line no-console
   console.log(JSON.stringify({ ok: true, report }, null, 2));
 } finally {
   if (tempAdminId) {
     await supabase.auth.admin.deleteUser(tempAdminId);
   }
-  if (tempSellerId) {
-    await supabase.auth.admin.deleteUser(tempSellerId);
+  if (tempSellerPromoteId) {
+    await supabase.auth.admin.deleteUser(tempSellerPromoteId);
+  }
+  if (tempSellerDeleteId) {
+    await supabase.auth.admin.deleteUser(tempSellerDeleteId);
   }
 }

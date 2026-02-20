@@ -28,6 +28,14 @@ function isManagedRole(role: unknown): role is keyof typeof ROLE_RANK {
   return role === 'seller' || role === 'admin' || role === 'owner';
 }
 
+function canManageTarget(actorRole: keyof typeof ROLE_RANK, targetRole: keyof typeof ROLE_RANK): boolean {
+  if (actorRole === 'owner') {
+    return true;
+  }
+
+  return ROLE_RANK[actorRole] > ROLE_RANK[targetRole];
+}
+
 const createSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
@@ -293,6 +301,75 @@ router.patch('/:id', requireRole('admin'), async (req, res) => {
     });
 
   return res.json({ user_id: data.id });
+});
+
+router.delete('/:id', requireRole('admin'), async (req, res) => {
+  const actorId = req.user?.id ?? null;
+  const actorRole = req.user?.role ?? null;
+
+  if (!actorId || !actorRole || !isManagedRole(actorRole)) {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Insufficient role for delete operation' } });
+  }
+
+  if (req.params.id === actorId) {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'You cannot delete your own user' } });
+  }
+
+  const { data: beforeProfile, error: beforeProfileError } = await supabaseService
+    .from('profiles')
+    .select('id, role, full_name')
+    .eq('id', req.params.id)
+    .maybeSingle();
+
+  if (beforeProfileError) {
+    return res.status(400).json({ error: { code: 'user_delete_failed', message: 'Profile lookup failed', details: beforeProfileError.message } });
+  }
+
+  if (!beforeProfile) {
+    return res.status(404).json({ error: { code: 'not_found', message: 'Profile not found' } });
+  }
+
+  if (!isManagedRole(beforeProfile.role)) {
+    return res.status(409).json({ error: { code: 'protected_role', message: 'Target profile role is protected' } });
+  }
+
+  if (!canManageTarget(actorRole, beforeProfile.role)) {
+    return res.status(403).json({ error: { code: 'forbidden_role_change', message: 'Insufficient role for target user' } });
+  }
+
+  const { data: authUserData, error: authUserError } = await supabaseService.auth.admin.getUserById(req.params.id);
+  if (authUserError) {
+    return res.status(400).json({ error: { code: 'user_delete_failed', message: 'Auth lookup failed', details: authUserError.message } });
+  }
+
+  const { error: deleteError } = await supabaseService.auth.admin.deleteUser(req.params.id);
+  if (deleteError) {
+    return res.status(400).json({ error: { code: 'user_delete_failed', message: 'Auth delete failed', details: deleteError.message } });
+  }
+
+  // Best-effort cleanup when FK cascade is not configured.
+  await supabaseService
+    .from('profiles')
+    .delete()
+    .eq('id', req.params.id);
+
+  await supabaseService
+    .from('audit_logs')
+    .insert({
+      actor_user_id: actorId,
+      action: 'user_deleted',
+      entity_type: 'profile',
+      entity_id: req.params.id,
+      before_json: {
+        role: beforeProfile.role,
+        full_name: beforeProfile.full_name,
+        email: authUserData.user.email ?? null
+      },
+      after_json: null,
+      meta_json: { source: 'admin_users_delete' }
+    });
+
+  return res.status(204).send();
 });
 
 export const adminUsersRouter = router;
