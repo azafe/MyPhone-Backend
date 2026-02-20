@@ -13,7 +13,8 @@
     "test:mvp:atomic": "node scripts/test-mvp-atomic-role.mjs",
     "test:finance:summary": "node scripts/test-finance-summary.mjs",
     "test:sales:list": "node scripts/test-sales-list-embed-regression.mjs",
-    "test:admin:users": "node scripts/test-admin-users-module.mjs"
+    "test:admin:users": "node scripts/test-admin-users-module.mjs",
+    "reconcile:stock": "node scripts/reconcile-stock-from-sales.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
