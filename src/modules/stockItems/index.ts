@@ -10,11 +10,63 @@ const statusEnum = z.enum(['available', 'reserved', 'sold', 'service_tech', 'dra
 const categoryEnum = z.enum(['used_premium', 'outlet', 'new']);
 const sortByEnum = z.enum(['received_at', 'created_at', 'updated_at', 'sale_price_ars', 'model', 'status']);
 const sortDirEnum = z.enum(['asc', 'desc']);
+const SALE_ITEMS_TO_SALES_FK_CANDIDATES = [
+  'sale_items_sale_id_fk',
+  'sale_items_sale_id_fkey'
+] as const;
 
 type RestError = {
   code?: string;
   message?: string;
   details?: string;
+  hint?: string;
+};
+
+type SaleHistoryRow = {
+  id: string;
+  sale_id: string;
+  stock_item_id: string;
+  qty: number | null;
+  sale_price_ars: number | null;
+  subtotal_ars: number | null;
+  sales?:
+    | {
+      id: string;
+      sale_date: string | null;
+      created_at: string | null;
+      status: string | null;
+      total_ars: number | null;
+      payment_method: string | null;
+      customers?:
+        | {
+          name: string | null;
+          phone: string | null;
+        }
+        | Array<{
+          name: string | null;
+          phone: string | null;
+        }>
+        | null;
+    }
+    | Array<{
+      id: string;
+      sale_date: string | null;
+      created_at: string | null;
+      status: string | null;
+      total_ars: number | null;
+      payment_method: string | null;
+      customers?:
+        | {
+          name: string | null;
+          phone: string | null;
+        }
+        | Array<{
+          name: string | null;
+          phone: string | null;
+        }>
+        | null;
+    }>
+    | null;
 };
 
 function normalizeLikeValue(raw: string): string {
@@ -30,6 +82,35 @@ function parseStatuses(raw?: string): string[] | undefined {
 
   if (statuses.length === 0) return undefined;
   return statuses;
+}
+
+function toMillis(value?: string | null): number {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function fetchSaleHistoryRows(stockItemId: string) {
+  let lastError: RestError | null = null;
+
+  for (const salesFkName of SALE_ITEMS_TO_SALES_FK_CANDIDATES) {
+    const { data, error } = await supabaseAdmin
+      .from('sale_items')
+      .select(`id, sale_id, stock_item_id, qty, sale_price_ars, subtotal_ars, sales!${salesFkName}(id, sale_date, created_at, status, total_ars, payment_method, customers(name, phone))`)
+      .eq('stock_item_id', stockItemId);
+
+    if (!error) {
+      return { data: (data ?? []) as SaleHistoryRow[], fkName: salesFkName, error: null as RestError | null };
+    }
+
+    lastError = error;
+    const relationMissing = error.code === 'PGRST200' || error.code === 'PGRST201';
+    if (!relationMissing) {
+      break;
+    }
+  }
+
+  return { data: null as SaleHistoryRow[] | null, fkName: null as string | null, error: lastError };
 }
 
 function mapStockError(error: RestError, fallbackCode: string, fallbackMessage: string) {
@@ -238,6 +319,74 @@ router.get('/', requireRole('admin', 'seller'), async (req, res) => {
     total: Number(count ?? (data?.length ?? 0)),
     page,
     page_size: pageSize
+  });
+});
+
+router.get('/imei/:imei/history', requireRole('admin', 'seller'), async (req, res) => {
+  const imei = req.params.imei?.trim();
+  if (!imei) {
+    return res.status(400).json({
+      error: { code: 'validation_error', message: 'IMEI required' }
+    });
+  }
+
+  const { data: stockItem, error: stockError } = await supabaseAdmin
+    .from('stock_items')
+    .select('*')
+    .eq('imei', imei)
+    .maybeSingle();
+
+  if (stockError) {
+    const mapped = mapStockError(stockError, 'stock_fetch_failed', 'Fetch failed');
+    return res.status(mapped.status).json({
+      error: { code: mapped.code, message: mapped.message, details: mapped.details }
+    });
+  }
+
+  if (!stockItem) {
+    return res.status(404).json({
+      error: { code: 'not_found', message: 'Stock item not found for IMEI' }
+    });
+  }
+
+  const { data: historyRows, error: historyError } = await fetchSaleHistoryRows(stockItem.id);
+  if (historyError) {
+    return res.status(400).json({
+      error: {
+        code: 'stock_history_fetch_failed',
+        message: 'Could not fetch IMEI history',
+        details: [historyError.code, historyError.message, historyError.hint].filter(Boolean).join(' | ')
+      }
+    });
+  }
+
+  const sales = (historyRows ?? [])
+    .map((row) => {
+      const sale = Array.isArray(row.sales) ? row.sales[0] : row.sales;
+      const customerRaw = sale?.customers;
+      const customer = Array.isArray(customerRaw) ? customerRaw[0] : customerRaw;
+
+      return {
+        sale_item_id: row.id,
+        sale_id: row.sale_id,
+        sale_date: sale?.sale_date ?? sale?.created_at ?? null,
+        sale_status: sale?.status ?? null,
+        sale_total_ars: sale?.total_ars ?? null,
+        payment_method: sale?.payment_method ?? null,
+        qty: row.qty,
+        sale_price_ars: row.sale_price_ars,
+        subtotal_ars: row.subtotal_ars,
+        customer_name: customer?.name ?? null,
+        customer_phone: customer?.phone ?? null
+      };
+    })
+    .sort((a, b) => toMillis(b.sale_date) - toMillis(a.sale_date));
+
+  return res.json({
+    imei,
+    stock_item: stockItem,
+    sales,
+    sales_count: sales.length
   });
 });
 
