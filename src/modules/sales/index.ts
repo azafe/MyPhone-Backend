@@ -171,7 +171,8 @@ const salePatchSchema = z.object({
 });
 
 const cancelSchema = z.object({
-  reason: z.string().trim().min(3).max(500)
+  reason: z.string().trim().min(3).max(500),
+  restock_state: z.enum(['outlet', 'used_premium', 'reserved', 'deposit', 'new', 'drawer', 'service_tech']).optional()
 });
 
 const registerPaymentSchema = z.object({
@@ -188,6 +189,15 @@ const settleSchema = z.object({
   method: paymentMethodSchema.optional(),
   currency: currencySchema.optional(),
   note: z.string().trim().max(500).nullable().optional()
+});
+
+const salesListQuerySchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  seller_id: z.string().uuid().optional(),
+  query: z.string().trim().min(1).optional(),
+  page: z.coerce.number().int().positive().optional().default(1),
+  page_size: z.coerce.number().int().positive().max(200).optional().default(30)
 });
 
 type SaleItemInput = {
@@ -428,6 +438,31 @@ function mapCheckoutRpcError(error: RpcLikeError): { status: number; code: strin
   }
 
   return { status: 500, code: 'sale_create_failed', message: 'Failed to create sale' };
+}
+
+function mapRestockStateToDb(restockState?: string | null): { status: 'available' | 'reserved' | 'drawer' | 'service_tech'; category: 'outlet' | 'used_premium' | 'new' | null } {
+  switch (restockState) {
+    case 'outlet':
+      return { status: 'available', category: 'outlet' };
+    case 'used_premium':
+      return { status: 'available', category: 'used_premium' };
+    case 'new':
+      return { status: 'available', category: 'new' };
+    case 'reserved':
+    case 'deposit':
+      return { status: 'reserved', category: null };
+    case 'drawer':
+      return { status: 'drawer', category: null };
+    case 'service_tech':
+      return { status: 'service_tech', category: null };
+    default:
+      return { status: 'available', category: null };
+  }
+}
+
+function shouldFallbackCancelWithoutRestock(error: RpcLikeError | null | undefined): boolean {
+  const message = `${error?.message ?? ''} ${error?.details ?? ''} ${error?.hint ?? ''}`.toLowerCase();
+  return error?.code === 'PGRST202' || message.includes('function') && message.includes('rpc_cancel_sale_v2');
 }
 
 function isEmbedRelationError(error: RpcLikeError | null | undefined): boolean {
@@ -722,7 +757,13 @@ async function handleCheckoutSale(req: Request, res: Response) {
   return res.status(201).json(responseBody);
 }
 
-router.get('/', requireRole('seller'), async (_req, res) => {
+router.get('/', requireRole('seller'), async (req, res) => {
+  const parsedQuery = salesListQuerySchema.safeParse(req.query);
+  if (!parsedQuery.success) {
+    return res.status(400).json(makeError('validation_error', 'Invalid sales query', parsedQuery.error.flatten()));
+  }
+
+  const filters = parsedQuery.data;
   const { data, error } = await fetchSalesListRows();
 
   if (error) {
@@ -770,7 +811,68 @@ router.get('/', requireRole('seller'), async (_req, res) => {
     });
   });
 
-  return res.json({ sales: rows });
+  const fromMillis = filters.from ? Date.parse(`${filters.from}T00:00:00Z`) : null;
+  const toMillis = filters.to ? Date.parse(`${filters.to}T23:59:59Z`) : null;
+  const query = filters.query ? filters.query.toLowerCase() : null;
+
+  const filteredRows = rows.filter((row) => {
+    if (filters.seller_id && row.seller_id !== filters.seller_id) {
+      return false;
+    }
+
+    if (fromMillis != null || toMillis != null) {
+      const rowDate = Date.parse(row.sale_date ?? row.created_at ?? '');
+      if (Number.isNaN(rowDate)) return false;
+      if (fromMillis != null && rowDate < fromMillis) return false;
+      if (toMillis != null && rowDate > toMillis) return false;
+    }
+
+    if (query) {
+      const haystack = [
+        row.customer_name,
+        row.customer_phone,
+        row.stock_model,
+        row.stock_imei,
+        row.notes,
+        row.details
+      ]
+        .filter((value): value is string => typeof value === 'string')
+        .join(' ')
+        .toLowerCase();
+
+      if (!haystack.includes(query)) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  const salesTotalsMap = new Map<string, { total_ars: number; pending_ars: number }>();
+  for (const row of filteredRows) {
+    if (!row.id || salesTotalsMap.has(row.id)) continue;
+    salesTotalsMap.set(row.id, {
+      total_ars: Number(row.total_ars ?? 0),
+      pending_ars: Number(row.balance_due_ars ?? 0)
+    });
+  }
+
+  const totalArs = Array.from(salesTotalsMap.values()).reduce((sum, item) => sum + item.total_ars, 0);
+  const pendingArs = Array.from(salesTotalsMap.values()).reduce((sum, item) => sum + item.pending_ars, 0);
+
+  const page = filters.page ?? 1;
+  const pageSize = filters.page_size ?? 30;
+  const offset = (page - 1) * pageSize;
+  const paginatedRows = filteredRows.slice(offset, offset + pageSize);
+
+  return res.json({
+    sales: paginatedRows,
+    total: filteredRows.length,
+    page,
+    page_size: pageSize,
+    total_ars: totalArs,
+    pending_ars: pendingArs
+  });
 });
 
 router.get('/:id', requireRole('seller'), async (req, res) => {
@@ -927,26 +1029,59 @@ router.post('/:id/cancel', requireRole('seller'), async (req, res) => {
     return res.status(401).json(makeError('unauthorized', 'Missing authenticated user'));
   }
 
+  if (req.user?.role !== 'owner') {
+    return res.status(403).json(makeError('forbidden', 'Only owner can cancel sales'));
+  }
+
   const parsed = cancelSchema.safeParse(req.body);
   if (!parsed.success) {
     logValidationError('sales.cancel', parsed.error.flatten(), { user_id: userId, sale_id: req.params.id });
     return res.status(400).json(makeError('validation_error', 'Invalid cancel payload', parsed.error.flatten()));
   }
 
-  const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc('rpc_cancel_sale_v2', {
-    p_sale_id: req.params.id,
-    p_reason: parsed.data.reason,
-    p_user_id: userId
-  });
+  const restock = mapRestockStateToDb(parsed.data.restock_state);
+  let rpcData: { sale_id?: string; status?: string; restock_status?: string; restock_category?: string | null } | null = null;
+  let rpcError: RpcLikeError | null = null;
+
+  {
+    const result = await supabaseAdmin.rpc('rpc_cancel_sale_v2', {
+      p_sale_id: req.params.id,
+      p_reason: parsed.data.reason,
+      p_user_id: userId,
+      p_restock_status: restock.status,
+      p_restock_category: restock.category
+    });
+    rpcData = result.data as typeof rpcData;
+    rpcError = result.error;
+  }
+
+  if (rpcError && shouldFallbackCancelWithoutRestock(rpcError)) {
+    const fallback = await supabaseAdmin.rpc('rpc_cancel_sale_v2', {
+      p_sale_id: req.params.id,
+      p_reason: parsed.data.reason,
+      p_user_id: userId
+    });
+    rpcData = fallback.data as typeof rpcData;
+    rpcError = fallback.error;
+  }
 
   if (rpcError) {
     const mapped = mapRpcError(rpcError);
     return res.status(mapped.status).json(makeError(mapped.code, mapped.message, rpcError.details ?? rpcError.message));
   }
 
+  const safeRpcData = (rpcData ?? null) as {
+    sale_id?: string;
+    status?: string;
+    restock_status?: string;
+    restock_category?: string | null;
+  } | null;
+
   return res.json({
-    sale_id: rpcData?.sale_id,
-    status: rpcData?.status ?? 'cancelled'
+    sale_id: safeRpcData?.sale_id,
+    status: safeRpcData?.status ?? 'cancelled',
+    restock_status: safeRpcData?.restock_status ?? restock.status,
+    restock_category: safeRpcData?.restock_category ?? restock.category
   });
 });
 
