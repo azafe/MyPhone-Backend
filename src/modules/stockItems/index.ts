@@ -482,6 +482,44 @@ router.patch('/:id', requireRole('admin', 'seller'), async (req, res) => {
     payload.purchase_ars = Number(payload.purchase_usd) * Number(payload.fx_rate_used);
   }
 
+  const { data: currentRow, error: currentError } = await supabaseAdmin
+    .from('stock_items')
+    .select('id, status, sale_id')
+    .eq('id', req.params.id)
+    .single();
+
+  if (currentError || !currentRow) {
+    const mapped = mapStockError(currentError ?? {}, 'not_found', 'Stock item not found');
+    return res.status(mapped.status).json({
+      error: { code: mapped.code, message: mapped.message, details: mapped.details }
+    });
+  }
+
+  const currentStatus = String(currentRow.status ?? '').toLowerCase();
+  const nextStatus = String(payload.status ?? currentRow.status ?? '').toLowerCase();
+  const hasSaleLink = typeof currentRow.sale_id === 'string' && currentRow.sale_id.trim().length > 0;
+  const soldOrLinked = currentStatus === 'sold' || hasSaleLink;
+
+  if (soldOrLinked && nextStatus !== 'sold') {
+    return res.status(409).json({
+      error: {
+        code: 'stock_conflict',
+        message: 'Sold/linked stock item cannot change to a non-sold state',
+        details: 'cancel_sale_or_controlled_reentry_required'
+      }
+    });
+  }
+
+  if (soldOrLinked && payload.is_promo === true) {
+    return res.status(409).json({
+      error: {
+        code: 'stock_conflict',
+        message: 'Sold/linked stock item cannot be marked as promo',
+        details: 'promo_not_allowed_for_sold_item'
+      }
+    });
+  }
+
   const { data, error } = await supabaseAdmin
     .from('stock_items')
     .update(payload)
