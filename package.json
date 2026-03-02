@@ -17,17 +17,20 @@
     "reconcile:stock": "node scripts/reconcile-stock-from-sales.mjs"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^13.2.3",
     "@supabase/supabase-js": "^2.49.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express-rate-limit": "^7.5.0",
     "express": "^4.19.2",
+    "express-rate-limit": "^7.5.0",
     "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.14.10",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"

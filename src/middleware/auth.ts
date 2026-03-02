@@ -1,72 +1,21 @@
 import type { Request, Response, NextFunction } from 'express';
-import { createClient } from '@supabase/supabase-js';
-
-const PUBLIC_PATH_PREFIXES = ['/auth/login'];
-const supabaseUrl = process.env.SUPABASE_URL ?? '';
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
-
-if (!supabaseUrl || !supabaseServiceRoleKey) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
-}
-
-function createServiceClient() {
-  return createClient(supabaseUrl, supabaseServiceRoleKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false
-    }
-  });
-}
-
-function isPublicPath(path: string): boolean {
-  return PUBLIC_PATH_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
-}
-
-function normalizeRole(role: unknown): 'owner' | 'admin' | 'seller' | null {
-  if (role === 'owner' || role === 'admin' || role === 'seller') {
-    return role;
-  }
-  return null;
-}
+import { resolveBearerUser } from '../lib/resolveAuthBearer.js';
 
 export async function authMiddleware(req: Request, res: Response, next: NextFunction) {
   try {
-    if (req.method === 'OPTIONS' || isPublicPath(req.path)) {
+    if (req.method === 'OPTIONS') {
       return next();
     }
 
-    const supabaseService = createServiceClient();
-
-    const header = req.header('authorization') || '';
-    const [scheme, token] = header.split(' ');
-    if (scheme !== 'Bearer' || !token) {
-      return res.status(401).json({ error: { code: 'unauthorized', message: 'Missing Bearer token' } });
-    }
-
-    const { data: userData, error: userError } = await supabaseService.auth.getUser(token);
-    if (userError || !userData?.user) {
-      return res.status(401).json({ error: { code: 'unauthorized', message: 'Invalid token', details: userError?.message } });
-    }
-
-    const { data: profile, error: profileError } = await supabaseService
-      .from('profiles')
-      .select('role, full_name')
-      .eq('id', userData.user.id)
-      .single();
-
-    if (profileError || !profile) {
-      return res.status(403).json({ error: { code: 'forbidden', message: 'Profile not found', details: profileError?.message } });
-    }
-
-    const role = normalizeRole(profile.role);
-    if (!role) {
-      return res.status(403).json({ error: { code: 'forbidden', message: 'Invalid profile role' } });
+    const authResult = await resolveBearerUser(req.header('authorization'));
+    if (!authResult.ok) {
+      return res.status(authResult.status).json({ error: authResult.error });
     }
 
     req.user = {
-      id: userData.user.id,
-      email: userData.user.email ?? null,
-      role
+      id: authResult.user.id,
+      email: authResult.user.email,
+      role: authResult.user.role
     };
 
     return next();

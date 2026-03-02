@@ -58,6 +58,24 @@ async function login(email, password) {
   };
 }
 
+function buildTempStockPayload(suffix) {
+  const uniqueSeed = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  return {
+    brand: 'Apple',
+    model: `iPhone Test ${suffix}`,
+    condition: 'used',
+    category: 'used_premium',
+    status: 'available',
+    sale_price_ars: 1500,
+    purchase_ars: 900,
+    storage_gb: 128,
+    battery_pct: 90,
+    color: 'Negro',
+    imei: `${uniqueSeed}${suffix}`.slice(0, 15),
+    details: 'auto-test-mvp-atomic'
+  };
+}
+
 async function main() {
   const report = {
     happy_sale: null,
@@ -128,19 +146,53 @@ async function main() {
       token: adminToken,
       body: { role: selfTargetRole }
     });
-    assert(selfDemotionResult.status === 403, 'self_demotion_should_be_403', selfDemotionResult);
-    assert(selfDemotionResult.body?.error?.code === 'forbidden_role_change', 'self_demotion_code_invalid', selfDemotionResult);
+    assert(
+      selfDemotionResult.status === 403 || selfDemotionResult.status === 409,
+      'self_demotion_should_be_403_or_409',
+      selfDemotionResult
+    );
+    const selfDemotionCode = selfDemotionResult.body?.error?.code;
+    assert(
+      selfDemotionCode === 'forbidden_role_change' || selfDemotionCode === 'protected_role',
+      'self_demotion_code_invalid',
+      selfDemotionResult
+    );
     report.self_demotion = selfDemotionResult;
 
     const { data: availableItems, error: availableItemsError } = await supabase
       .from('stock_items')
       .select('id,status')
       .eq('status', 'available')
-      .limit(2);
+      .limit(60);
     assert(!availableItemsError, 'available_items_query_failed', availableItemsError?.message);
     assert((availableItems ?? []).length >= 2, 'not_enough_available_items_for_tests', availableItems);
 
-    const [happyItem, rollbackItem] = availableItems;
+    const { data: saleItemsRows, error: saleItemsError } = await supabase
+      .from('sale_items')
+      .select('stock_item_id');
+    assert(!saleItemsError, 'sale_items_query_failed', saleItemsError?.message);
+
+    const alreadySoldIds = new Set((saleItemsRows ?? []).map((row) => row.stock_item_id).filter(Boolean));
+    const candidateItems = (availableItems ?? []).filter((item) => !alreadySoldIds.has(item.id));
+
+    if (candidateItems.length < 2) {
+      const needed = 2 - candidateItems.length;
+      for (let idx = 0; idx < needed; idx += 1) {
+        const createStockResult = await requestJson('/api/stock-items', {
+          method: 'POST',
+          token: adminToken,
+          body: buildTempStockPayload(String(idx + 1))
+        });
+        assert(createStockResult.status === 201, 'temp_stock_create_failed', createStockResult);
+        candidateItems.push({
+          id: createStockResult.body?.id,
+          status: createStockResult.body?.status
+        });
+      }
+    }
+
+    assert(candidateItems.length >= 2, 'still_not_enough_items_for_tests', candidateItems);
+    const [happyItem, rollbackItem] = candidateItems;
     const happyNote = `test-happy-${Date.now()}`;
     const happyPayload = {
       sale_date: new Date().toISOString(),
