@@ -97,7 +97,7 @@ const loginSchema = z.object({
 });
 
 const passkeyLoginOptionsSchema = z.object({
-  email: z.string().email()
+  email: z.string().email().optional()
 });
 
 const passkeyVerifySchema = z.object({
@@ -479,14 +479,6 @@ router.post('/passkeys/login/options', async (req, res) => {
   }
 
   const email = normalizeEmail(parsed.data.email);
-  if (!email) {
-    return res.status(400).json({
-      error: {
-        code: 'validation_error',
-        message: 'Email is required for passkey login'
-      }
-    });
-  }
 
   const origin = resolveOriginFromRequest(req);
   if (!origin) {
@@ -508,42 +500,54 @@ router.post('/passkeys/login/options', async (req, res) => {
     });
   }
 
-  const supabaseAuth = createAuthClient();
-  const { data: passkeys, error: passkeysError } = await supabaseAuth
-    .from('auth_passkeys')
-    .select('credential_id, transports')
-    .eq('is_enabled', true)
-    .eq('user_email', email)
-    .order('created_at', { ascending: false })
-    .limit(20);
+  let allowCredentials:
+    | {
+        id: string;
+        type: 'public-key';
+        transports?: AuthenticatorTransportFuture[];
+      }[]
+    | undefined;
 
-  if (passkeysError) {
-    return res.status(500).json({
-      error: {
-        code: 'passkey_login_options_failed',
-        message: 'Could not prepare passkey login',
-        details: passkeysError.message
-      }
-    });
-  }
+  if (email) {
+    const supabaseAuth = createAuthClient();
+    const { data: passkeys, error: passkeysError } = await supabaseAuth
+      .from('auth_passkeys')
+      .select('credential_id, transports')
+      .eq('is_enabled', true)
+      .eq('user_email', email)
+      .order('created_at', { ascending: false })
+      .limit(20);
 
-  if (!passkeys || passkeys.length === 0) {
-    return res.status(404).json({
-      error: {
-        code: 'passkey_not_registered',
-        message: 'No passkey found for this email'
-      }
-    });
+    if (passkeysError) {
+      return res.status(500).json({
+        error: {
+          code: 'passkey_login_options_failed',
+          message: 'Could not prepare passkey login',
+          details: passkeysError.message
+        }
+      });
+    }
+
+    if (!passkeys || passkeys.length === 0) {
+      return res.status(404).json({
+        error: {
+          code: 'passkey_not_registered',
+          message: 'No passkey found for this email'
+        }
+      });
+    }
+
+    allowCredentials = passkeys.map((passkey) => ({
+      id: passkey.credential_id,
+      type: 'public-key' as const,
+      transports: toAuthenticatorTransports(passkey.transports)
+    }));
   }
 
   const options = await generateAuthenticationOptions({
     rpID,
-    allowCredentials: passkeys.map((passkey) => ({
-      id: passkey.credential_id,
-      type: 'public-key',
-      transports: toAuthenticatorTransports(passkey.transports)
-    })),
-    userVerification: 'preferred'
+    userVerification: 'preferred',
+    ...(allowCredentials ? { allowCredentials } : {})
   });
 
   const challengeId = createPendingChallenge({
