@@ -96,6 +96,15 @@ const loginSchema = z.object({
   password: z.string().min(6)
 });
 
+const forgotPasswordSchema = z.object({
+  email: z.string().email()
+});
+
+const resetPasswordSchema = z.object({
+  access_token: z.string().min(10),
+  password: z.string().min(6)
+});
+
 const passkeyLoginOptionsSchema = z.object({
   email: z.string().email().optional()
 });
@@ -271,6 +280,81 @@ router.get('/me', async (req, res) => {
     full_name: authResult.user.full_name ?? authResult.user.email ?? 'User',
     role: authResult.user.role
   });
+});
+
+router.post('/forgot-password', async (req, res) => {
+  const parsed = forgotPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: {
+        code: 'validation_error',
+        message: 'Email inválido',
+        details: parsed.error.flatten()
+      }
+    });
+  }
+
+  const appUrl = (process.env.APP_URL ?? 'https://myphonetuc.netlify.app').replace(/\/$/, '');
+  const redirectTo = `${appUrl}/reset-password`;
+
+  const supabaseAuth = createAuthClient();
+  const { error } = await supabaseAuth.auth.admin.generateLink({
+    type: 'recovery',
+    email: parsed.data.email,
+    options: { redirectTo }
+  });
+
+  if (error) {
+    console.error('[forgot-password]', error.message);
+  }
+
+  // Siempre devolvemos éxito para no revelar si el email existe
+  return res.json({
+    ok: true,
+    message: 'Si el email está registrado, recibirás un enlace para restablecer tu contraseña.'
+  });
+});
+
+router.post('/reset-password', async (req, res) => {
+  const parsed = resetPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: {
+        code: 'validation_error',
+        message: 'Datos inválidos',
+        details: parsed.error.flatten()
+      }
+    });
+  }
+
+  const supabaseAuth = createAuthClient();
+
+  // Verify the access token and get the user
+  const { data: userData, error: userError } = await supabaseAuth.auth.getUser(parsed.data.access_token);
+  if (userError || !userData.user) {
+    return res.status(401).json({
+      error: {
+        code: 'invalid_token',
+        message: 'El enlace de recuperación es inválido o expiró. Solicitá uno nuevo.'
+      }
+    });
+  }
+
+  const { error: updateError } = await supabaseAuth.auth.admin.updateUserById(userData.user.id, {
+    password: parsed.data.password
+  });
+
+  if (updateError) {
+    return res.status(500).json({
+      error: {
+        code: 'reset_password_failed',
+        message: 'No se pudo actualizar la contraseña',
+        details: updateError.message
+      }
+    });
+  }
+
+  return res.json({ ok: true, message: 'Contraseña actualizada correctamente.' });
 });
 
 router.post('/passkeys/register/options', async (req, res) => {
